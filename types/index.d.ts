@@ -1,5 +1,27 @@
 export type HcpOption = { value: string; label: string; hint?: string }
 
+/**
+ * A picture on a card, or one the person sent: the file Claude reads, and the
+ * thumbnails the mod made of it. Only paths live here; thumbnail bytes are
+ * read when drawn, so `$.state` stays small.
+ */
+export type HcpMedia = {
+  /** The file Claude reads: an image, or a frame sampled from `video`. */
+  path: string
+  caption?: string
+  /** The video a frame was sampled from; Open plays it. */
+  video?: string
+  /** A jpeg of at most 640px, drawn as an Svg on desktop, VS Code and mobile. */
+  thumbPath?: string
+  /** A 200px jpeg for grids. */
+  miniPath?: string
+  /** A png the terminal's Image reads itself. */
+  pngPath?: string
+  /** `thumbPath`'s size in pixels. */
+  width?: number
+  height?: number
+}
+
 /** How an answer reaches Claude: a prompt now, a silent note, or a prompt at `dueAt`. */
 export type HcpDelivery = 'now' | 'nntr' | 'later'
 
@@ -32,6 +54,13 @@ export type HcpCard = {
   delivery?: HcpDelivery
   answer?: string
   createdAt: number
+  /** Pictures Claude attached, side by side (`grid`) or one at a time (`slides`). */
+  media?: HcpMedia[]
+  layout?: 'grid' | 'slides'
+  /** The slide on show. */
+  slide?: number
+  /** The person's note on a slide, by its index. */
+  slideNotes?: Record<string, string>
 }
 
 export type HcpScheduled = {
@@ -55,6 +84,12 @@ declare module 'claude-code' {
       seq: number
       /** Bumped after each quick message, so its field draws empty again. */
       quickSent: number
+      /** The card j/k moved to: its buttons carry the hotkeys. Empty: the first open one. */
+      active: string
+      /** Pictures the person attached, sent with their next quick message. */
+      outbox: HcpMedia[]
+      /** Pictures the person pasted into the prompt box, newest first, drawn in the pane. */
+      fromYou: HcpMedia[]
     }
   }
 }

@@ -4,17 +4,21 @@
 // paragraphs. Cards draw inline at their tool row and in the HCP pane.
 
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, RenderSurface } from 'claude-code'
 
-import type { HcpCard, HcpDelivery, HcpMode, HcpScheduled } from '../types'
+import type { HcpCard, HcpDelivery, HcpMedia, HcpMode, HcpScheduled } from '../types'
+import { existing, expandAll, pastedImages, prepare, saveBytes, thumbnails } from './media'
 import {
   ASK_TOOL,
   HANDOFF_TOOL,
+  MAX_MEDIA,
   PROTOCOL,
   SERVICES,
   SHARE_TOOL,
   STEERS,
+  VIDEO_FILE,
   answerText,
+  attachedText,
   autoHandoffNote,
   cantText,
   clip,
@@ -24,11 +28,13 @@ import {
   markdownToHtml,
   markdownToPlain,
   needsAuthServers,
+  parseMedia,
   parseOffset,
   parseOptions,
   parseWhen,
   postedText,
   smartLater,
+  splitPaths,
 } from './model'
 import type { Steer, When } from './model'
 import { cardView, inbox } from './views'
@@ -45,12 +51,17 @@ const mode = atom({ plugin: 'hcp', key: 'mode' } as const, 'pairing' as HcpMode)
 const isConcise = atom({ plugin: 'hcp', key: 'isConcise' } as const, false)
 const seq = atom({ plugin: 'hcp', key: 'seq' } as const, 0)
 const quickSent = atom({ plugin: 'hcp', key: 'quickSent' } as const, 0)
+const active = atom({ plugin: 'hcp', key: 'active' } as const, '')
+const outbox = atom({ plugin: 'hcp', key: 'outbox' } as const, [] as HcpMedia[])
+const fromYou = atom({ plugin: 'hcp', key: 'fromYou' } as const, [] as HcpMedia[])
 
 // UTC offset in minutes, from `date +%z`; the hooks environment's own zone may differ.
 let offset = -new Date().getTimezoneOffset()
 const timers = new Map<string, { cancel: () => void }>()
 // Typed but unsent text, kept out of $.state so typing redraws nothing.
 const drafts = new Map<string, string>()
+// A slide's typed note, by `<card>:<slide>`, until Enter keeps it or the card is answered.
+const slideDrafts = new Map<string, string>()
 let quickDraftText = ''
 // Bash calls that raised a handoff: their result rows draw the card.
 const handoffCalls = new Set<string>()
@@ -247,7 +258,15 @@ async function answer($: Engine, id: string, delivery: HcpDelivery, note?: strin
 async function answerCard($: Engine, id: string, delivery: HcpDelivery, note?: string, suffix = '') {
   const card = await findCard($, id)
   if (!card || card.status !== 'open') return
-  const withNote = { ...card, note: note ?? drafts.get(id) ?? card.note }
+  // A picture dropped into the note goes to Claude as a path it reads.
+  const typed = splitPaths(note ?? drafts.get(id) ?? card.note)
+  const attached = await expandAll($, (await existing($, typed.paths)).map(path => ({ path })))
+  const withNote = {
+    ...card,
+    note: typed.rest || (attached.length > 0 ? 'See the attached pictures.' : ''),
+    slideNotes: keptSlideNotes(card),
+  }
+  suffix += attachedText(attached)
 
   if (delivery === 'later' && card.kind === 'handoff') {
     const when = await later($)
@@ -268,6 +287,7 @@ async function answerCard($: Engine, id: string, delivery: HcpDelivery, note?: s
   const full = text + suffix
 
   drafts.delete(id)
+  for (const at of slideDrafts.keys()) if (at.startsWith(`${id}:`)) slideDrafts.delete(at)
   if (delivery === 'later') {
     const when = await later($)
     await schedule($, { kind: 'prompt', text: full, dueAt: when.dueAt, cardId: id })
@@ -286,6 +306,67 @@ async function answerCard($: Engine, id: string, delivery: HcpDelivery, note?: s
   }
   await patchCard($, id, c => ({ ...c, note: withNote.note, status: 'answered', delivery, answer: full, progress: undefined }))
   await refreshStatus($)
+}
+
+/** The slide notes kept with Enter, overlaid with ones typed and not yet kept. */
+function keptSlideNotes(card: HcpCard): Record<string, string> {
+  const notes = { ...card.slideNotes }
+  for (const [at, text] of slideDrafts) {
+    const [cardId, slide] = at.split(':')
+    if (cardId === card.id && slide !== undefined) notes[slide] = text
+  }
+
+  return notes
+}
+
+/**
+ * Attaches the pictures and videos named in typed text to the outbox, and
+ * answers the words left around them. A video's frames are sampled first.
+ */
+async function attachFrom($: Engine, text: string): Promise<{ rest: string; added: number }> {
+  const typed = splitPaths(text)
+  const found = await existing($, typed.paths)
+  if (found.length === 0) return { rest: text, added: 0 }
+  $.ui.toast(found.some(p => VIDEO_FILE.test(p)) ? 'Sampling video frames…' : 'Attaching…')
+  const media = await expandAll($, found.map(path => ({ path })))
+  await update($, outbox, list => [...list, ...media].slice(-MAX_MEDIA))
+
+  return { rest: typed.rest, added: media.length }
+}
+
+/** The open cards in the order the pane draws them. */
+async function openCards($: Engine) {
+  return (await read($, cards)).filter(c => c.status === 'open')
+}
+
+/** The element j/k puts the focus on: a card's first option, or its main button. */
+function focusKey(card: HcpCard) {
+  if (card.kind === 'ask') return card.options[0] ? `${card.id}-opt-${card.options[0].value}` : `${card.id}-send`
+
+  return card.kind === 'share' ? `${card.id}-copy-rich` : `${card.id}-done`
+}
+
+/** Pictures a person pasted into the prompt box, shown in the pane; the prompt itself is untouched. */
+async function mirrorPasted(
+  $: Engine,
+  images: readonly { filename?: string }[],
+  reads: readonly Promise<{ base64?: string; mediaType?: string; next?: number } | undefined>[],
+) {
+  const paths: string[] = []
+  for (const [at, read] of reads.entries()) {
+    const got = await read
+    // Only a whole item fits: a second slice would need another call before the submission settles.
+    if (got?.base64 === undefined || got.next !== undefined) continue
+    const extension = got.mediaType?.split('/')[1] ?? 'png'
+    const saved = await saveBytes($, got.base64, images[at]?.filename ?? `pasted.${extension}`)
+    if (saved !== undefined) paths.push(saved)
+  }
+  if (paths.length < images.length) paths.push(...(await pastedImages($, images.length - paths.length)))
+  const media: HcpMedia[] =
+    paths.length > 0
+      ? await Promise.all(paths.map(path => prepare($, path)))
+      : images.map(image => ({ path: image.filename ?? 'image', caption: image.filename ?? 'pasted image' }))
+  await update($, fromYou, list => [...media, ...list].slice(0, 8))
 }
 
 async function verifyAndSend($: Engine, id: string) {
@@ -431,8 +512,9 @@ function actionsFor($: Engine): Actions {
     quickDraft: text => void (quickDraftText = text),
     quickSend: (delivery, typed) =>
       void (async () => {
-        const text = (typed ?? quickDraftText).trim()
-        if (!text) {
+        const { rest, added } = await attachFrom($, (typed ?? quickDraftText).trim())
+        const attached = await read($, outbox)
+        if (!rest && attached.length === 0) {
           $.ui.toast('Type a message first.')
 
           return
@@ -440,6 +522,13 @@ function actionsFor($: Engine): Actions {
         quickDraftText = ''
         // The field clears before the engine is asked, since a mid-turn prompt resolves late.
         await update($, quickSent, n => n + 1)
+        if (!rest && added > 0) {
+          $.ui.toast(`Attached ${added}. Type a message and press Enter to send with it, or Send as NNTR.`)
+
+          return
+        }
+        const text = (rest || 'See the attached pictures.') + attachedText(attached)
+        if (attached.length > 0) await update($, outbox, () => [])
         if (delivery === 'later') {
           const when = await later($)
           await schedule($, { kind: 'prompt', text, dueAt: when.dueAt })
@@ -464,15 +553,76 @@ function actionsFor($: Engine): Actions {
         await update($, queue, list => list.filter(q => q.id !== id))
       })(),
     clearHistory: () => void update($, cards, list => list.filter(c => c.status === 'open')),
+    slide: (id, step) =>
+      void patchCard($, id, c => {
+        const count = c.media?.length ?? 0
+
+        return count === 0 ? c : { ...c, slide: ((((c.slide ?? 0) + step) % count) + count) % count }
+      }),
+    slideNote: (id, at, text, isKept) => {
+      slideDrafts.set(`${id}:${at}`, text)
+      if (isKept) void patchCard($, id, c => ({ ...c, slideNotes: { ...c.slideNotes, [String(at)]: text.trim() } }))
+    },
+    openMedia: media => {
+      const target = media.video ?? media.path
+      void $.process.run(['open', target], { timeoutMs: 10_000 }).then(
+        ran => ran.exitCode === 0 || $.ui.toast(`Couldn't open ${target}`),
+        () => $.ui.toast(`Open it yourself: ${target}`),
+      )
+    },
+    unattach: at => void update($, outbox, list => list.filter((_, i) => i !== at)),
+    clearAttachments: () => void update($, outbox, () => []),
+    clearFromYou: () => void update($, fromYou, () => []),
+    move: step =>
+      void (async () => {
+        const open = await openCards($)
+        if (open.length === 0) return
+        const current = await read($, active)
+        const at = Math.max(0, open.findIndex(c => c.id === current))
+        const next = open[(((at + step) % open.length) + open.length) % open.length]!
+        await update($, active, () => next.id)
+        await $.ui.focus({ requestId: PANE, key: focusKey(next) }).catch(() => undefined)
+      })(),
   }
 }
 
+/** A tool's `media`, made into pictures, and the paths that weren't there to tell Claude about. */
+async function mediaFields($: Engine, input: Record<string, unknown>) {
+  const wanted = parseMedia(input.media)
+  if (wanted.length === 0) return { fields: {}, note: '' }
+  const resolved = await Promise.all(
+    wanted.map(async item => {
+      const [path] = await existing($, [item.path])
 
-async function snapshot($: Engine): Promise<Snapshot> {
+      return path === undefined ? undefined : { ...item, path }
+    }),
+  )
+  const found = resolved.filter((item): item is NonNullable<typeof item> => item !== undefined)
+  const missing = wanted.filter((_, at) => resolved[at] === undefined).map(item => item.path)
+  const media = await expandAll($, found)
+  const layout: HcpCard['layout'] =
+    input.layout === 'grid' || input.layout === 'slides' ? input.layout : media.length > 4 ? 'slides' : 'grid'
+  const note = missing.length > 0 ? ` Not on the card, no such image or video file: ${missing.join(', ')}.` : ''
+
+  return { fields: media.length > 0 ? { media, layout } : {}, note }
+}
+
+/** Thumbnail bytes where pictures draw as Svg; the terminal's Image reads its files itself. */
+async function thumbsFor($: Engine, surface: RenderSurface, media: readonly HcpMedia[]) {
+  return surface === 'terminal' ? new Map<string, string>() : thumbnails($, media)
+}
+
+async function snapshot($: Engine, surface: RenderSurface): Promise<Snapshot> {
   const at = await $.clock.now()
+  const all = await read($, cards)
+  const open = all.filter(c => c.status === 'open')
+  const current = await read($, active)
+  const attached = await read($, outbox)
+  const pasted = await read($, fromYou)
+  const shown = [...open.flatMap(c => c.media ?? []), ...attached, ...pasted]
 
   return {
-    cards: await read($, cards),
+    cards: all,
     queue: await read($, queue),
     mode: await read($, mode),
     isConcise: await read($, isConcise),
@@ -480,6 +630,11 @@ async function snapshot($: Engine): Promise<Snapshot> {
     laterLabel: smartLater(at, offset).label,
     needsAuth: await readNeedsAuth($),
     formatAt: ms => formatLocal(ms, offset, at),
+    active: open.some(c => c.id === current) ? current : open[0]?.id,
+    outbox: attached,
+    fromYou: pasted,
+    surface,
+    thumbs: await thumbsFor($, surface, shown),
   }
 }
 
@@ -554,6 +709,7 @@ export const register: Register = on => {
         ? [input.recommended]
         : []
     const picked = options.map(o => o.value).filter(v => wanted.includes(v))
+    const pictures = await mediaFields($, input)
     const card = await postCard($, {
       ...blank,
       kind: 'ask',
@@ -565,14 +721,16 @@ export const register: Register = on => {
       options,
       isMulti,
       picked: isMulti ? picked : picked.slice(0, 1),
+      ...pictures.fields,
     })
 
-    return { result: postedText(card) }
+    return { result: postedText(card) + pictures.note }
   }).catch(() => ({ deny: 'hcp could not post the card; ask in prose this time.' }))
 
   on('tool.call', { tool: 'mcp__hcp__handoff' }, async ($, e) => {
     const input = e as unknown as Record<string, unknown>
     if (typeof input.title !== 'string') return { deny: 'handoff needs a `title`.' }
+    const pictures = await mediaFields($, input)
     const card = await postCard($, {
       ...blank,
       kind: 'handoff',
@@ -581,10 +739,11 @@ export const register: Register = on => {
       title: input.title,
       ...(typeof input.detail === 'string' ? { detail: input.detail } : {}),
       ...(typeof input.fix === 'string' ? { fix: input.fix } : {}),
+      ...pictures.fields,
     })
     void $.ui.notify(card.title, { title: 'Claude needs you' })
 
-    return { result: postedText(card) }
+    return { result: postedText(card) + pictures.note }
   }).catch(() => ({ deny: 'hcp could not post the card; ask in prose this time.' }))
 
   on('tool.call', { tool: 'mcp__hcp__share' }, async ($, e) => {
@@ -592,6 +751,7 @@ export const register: Register = on => {
     if (typeof input.title !== 'string' || typeof input.text !== 'string') {
       return { deny: 'share needs a `title` and the `text` to paste.' }
     }
+    const pictures = await mediaFields($, input)
     const card = await postCard($, {
       ...blank,
       kind: 'share',
@@ -600,10 +760,30 @@ export const register: Register = on => {
       title: input.title,
       draft: input.text,
       ...(typeof input.audience === 'string' ? { audience: input.audience } : {}),
+      ...pictures.fields,
     })
 
-    return { result: postedText(card) }
+    return { result: postedText(card) + pictures.note }
   }).catch(() => ({ deny: 'hcp could not post the card; print the text this time.' }))
+
+  // Pictures pasted into the prompt box also show in the pane. The prompt passes on unchanged
+  // and unawaited work; the reads start first, since the engine answers them only in flight.
+  on('prompt.submit', async ($, e, next) => {
+    const images = (e.attachments ?? []).filter(a => a.type === 'image')
+    if (images.length === 0 || e.origin.kind !== 'composer') return next(e)
+    const reads = images.map(a =>
+      a.id === undefined
+        ? Promise.resolve(undefined)
+        : $.prompt.media({ id: a.id }).then(
+            media => (media.base64 === undefined ? undefined : media),
+            () => undefined,
+          ),
+    )
+    const result = await next(e)
+    void mirrorPasted($, images, reads).catch(() => undefined)
+
+    return result
+  })
 
   // Searching for an unauthorized server's tools is the moment it matters: raise its handoff then.
   on('tool.call', { tool: 'ToolSearch' }, async ($, e, next) => {
@@ -640,7 +820,8 @@ export const register: Register = on => {
 
       return { text: 'HCP history cleared.' }
     }
-    const opened = await $.ui.open({ id: PANE, title: 'HCP' })
+    // Asked for, the pane takes the keyboard so its keys work at once; new cards never take it.
+    const opened = await $.ui.open({ id: PANE, title: 'HCP', focus: true })
 
     return { text: opened.isPlaced ? 'HCP pane opened.' : 'HCP' }
   })
@@ -665,7 +846,7 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) =>
-    inbox($.ui.resolve(e), await snapshot($), actionsFor($)),
+    inbox($.ui.resolve(e), await snapshot($, e.surface), actionsFor($)),
   )
 
   // Where no surface places the pane (VS Code may not), /hcp draws the inbox inline.
@@ -673,15 +854,18 @@ export const register: Register = on => {
     const isPlaced = (await $.ui.panes()).some(p => p.id === PANE && p.isPlaced)
     if (isPlaced || e.props.text !== 'HCP') return next(e)
 
-    return inbox($.ui.resolve(e), await snapshot($), actionsFor($))
+    return inbox($.ui.resolve(e), await snapshot($, e.surface), actionsFor($))
   })
 
   on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
     if (!e.props.tool.startsWith(TOOL_PREFIX) || e.props.isExpanded) return next(e)
     const card = (await read($, cards)).find(c => c.toolUseId === e.props.tool_use_id)
     if (!card) return next(e)
-
-    return cardView($.ui.resolve(e), card, actionsFor($), (await snapshot($)).laterLabel)
+    return cardView($.ui.resolve(e), card, actionsFor($), {
+      surface: e.surface,
+      laterLabel: smartLater(await $.clock.now(), offset).label,
+      thumbs: await thumbsFor($, e.surface, card.media ?? []),
+    })
   })
 
   on('ui.render', { component: 'ToolResult' }, async ($, e, next) => {
@@ -697,10 +881,12 @@ export const register: Register = on => {
     const els = $.ui.resolve(e)
     const { Box } = els
 
+    const laterLabel = smartLater(await $.clock.now(), offset).label
+
     return (
       <Box flexDirection="column">
         {await next(e)}
-        {cardView(els, card, actionsFor($), (await snapshot($)).laterLabel)}
+        {cardView(els, card, actionsFor($), { surface: e.surface, laterLabel, thumbs: new Map() })}
       </Box>
     )
   })

@@ -25,6 +25,14 @@ Clickable seams between you and Claude, so a decision is a click instead of a pa
 - **Quick replies:** Yes, No, Yes · NNTR, No · NNTR, 👀 Seen.
 - **Message field** with Send / NNTR / Later.
 
+**Pictures:**
+
+- Claude passes `media` (image paths with captions, or a video) on any card. Up to 4 draw as a grid, more as **slides** with ‹ › and a note per slide that goes back with the answer. A video is sampled into 8 frames (ffmpeg), and **▶ Play** opens the original. Thumbnails are made with `sips` under `$TMPDIR/hcp-media/<session>/`.
+- The terminal draws them with its native image support (kitty, Ghostty, iTerm2 3.5+; elsewhere the caption shows, with **⤢ Open**). Desktop, VS Code and mobile draw them as an SVG thumbnail.
+- **To send Claude a picture**, drop an image or video file into the message field (or type its path) and press Enter. It's attached with a thumbnail, then sent with your next message as paths Claude reads. A path in a card's note is attached the same way. Pictures you paste into the normal prompt box also show under **You sent**.
+
+**Keys** (terminal; focus the pane with ctrl+x tab or `/hcp`, and Tab off a text field first): `j`/`k` next/previous card · `1`–`8` pick an option · `s` send/copy/done · `x` dismiss · `h`/`l` previous/next slide · `o` open · `y`/`n` quick Yes/No. New cards never take the focus.
+
 **Commands:**
 
 - `/hcp [pairing|heads-down|away|clear]`: open the pane. Where no pane is placed, the inbox draws inline.

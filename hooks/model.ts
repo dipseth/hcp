@@ -1,7 +1,7 @@
 // The plain logic of the hcp mod: what Claude is told, what an answer says,
 // which failures are an auth handoff, and when "later" is.
 
-import type { HcpCard, HcpDelivery, HcpOption } from '../types'
+import type { HcpCard, HcpDelivery, HcpMedia, HcpOption } from '../types'
 
 export const PROTOCOL = `# Human Context Protocol (hcp mod)
 
@@ -11,6 +11,8 @@ The person has an HCP surface: clickable cards drawn inline in the chat and in a
 - Text the person will paste elsewhere (a Slack message, an email, a PR description, a status update): call mcp__hcp__share instead of printing it for them to select. It is outward-facing: write it for its audience.
 - A step only they can do (an interactive login, VPN, an access request, /mcp auth, running something locally): call mcp__hcp__handoff. Auth failures from gcloud/bq in Bash, and MCP servers that need authorizing, are raised as handoffs for you, and you'll get a note saying so: don't retry the command, debug it, or run the login yourself.
 - Cards don't block. Keep going on work that doesn't need the answer, or end your turn with one short line.
+- Pictures belong on the card: pass screenshots, renders or charts the person should look at in \`media\` (absolute paths, a one-line \`caption\` each; a video is sampled into frames) on any of the three tools, instead of describing them in prose.
+- A message ending in "Attached, view each with Read before acting:" carries the person's images or video frames: Read every listed path before you answer.
 
 Messages from the surface start with "[HCP":
 - "[HCP c3] ..." is the person's answer, sent to start a turn: act on it.
@@ -23,6 +25,31 @@ Messages from the surface start with "[HCP":
 - "[HCP concise] on" means short replies and no recaps until it says off.`
 
 type Schema = Record<string, unknown>
+
+/** At most this many pictures on a card, video frames included. */
+export const MAX_MEDIA = 12
+
+const MEDIA_PROPS = {
+  media: {
+    type: 'array',
+    maxItems: MAX_MEDIA,
+    description:
+      'Pictures to show on the card: screenshots, renders, charts. A video is sampled into frames the person can flip through.',
+    items: {
+      type: 'object',
+      properties: {
+        path: { type: 'string', description: 'Absolute path to an image (png, jpg, gif, webp, heic) or a video (mov, mp4, webm).' },
+        caption: { type: 'string', description: 'One line on what it shows.' },
+      },
+      required: ['path'],
+    },
+  },
+  layout: {
+    type: 'string',
+    enum: ['grid', 'slides'],
+    description: 'grid: side by side; slides: one at a time with a note per slide. Default: grid up to 4, slides above.',
+  },
+} as const
 
 export const ASK_TOOL = {
   name: 'ask',
@@ -54,6 +81,7 @@ export const ASK_TOOL = {
         items: { type: 'string' },
         description: 'Values to preselect: your recommendation.',
       },
+      ...MEDIA_PROPS,
     },
     required: ['title', 'options'],
   } satisfies Schema,
@@ -70,6 +98,7 @@ export const HANDOFF_TOOL = {
       title: { type: 'string', description: 'What they need to do, imperative, one line.' },
       detail: { type: 'string', description: 'What it unblocks.' },
       fix: { type: 'string', description: 'The command they run, if there is one.' },
+      ...MEDIA_PROPS,
     },
     required: ['title'],
   } satisfies Schema,
@@ -86,6 +115,7 @@ export const SHARE_TOOL = {
       title: { type: 'string', description: 'What it is, a few words.' },
       text: { type: 'string', description: 'The text to paste, in markdown.' },
       audience: { type: 'string', description: 'Where it goes: Slack channel, email, PR or issue comment.' },
+      ...MEDIA_PROPS,
     },
     required: ['title', 'text'],
   } satisfies Schema,
@@ -137,23 +167,40 @@ const tag = (card: HcpCard, delivery: HcpDelivery) =>
 
 const noteOf = (card: HcpCard) => (card.note.trim() ? ` Note: "${card.note.trim()}"` : '')
 
+/** The person's notes on slides, in slide order, each naming its picture. */
+function slideNotesOf(card: HcpCard): string {
+  const notes = Object.entries(card.slideNotes ?? {})
+    .filter(([, text]) => text.trim())
+    .sort(([a], [b]) => Number(a) - Number(b))
+
+  return notes
+    .map(([at, text]) => {
+      const media = card.media?.[Number(at)]
+      const what = media?.caption ? ` ("${media.caption}")` : media ? ` (${media.path})` : ''
+
+      return ` On image ${Number(at) + 1}${what}: "${text.trim()}"`
+    })
+    .join('')
+}
+
 /** What Claude reads for an answer, or undefined when there is nothing to say yet. */
 export function answerText(card: HcpCard, delivery: HcpDelivery): string | undefined {
+  const onSlides = slideNotesOf(card)
   if (card.kind === 'ask') {
     const labels = card.options.filter(o => card.picked.includes(o.value)).map(o => o.label)
-    if (labels.length === 0 && !card.note.trim()) return undefined
+    if (labels.length === 0 && !card.note.trim() && !onSlides) return undefined
     const choice = labels.length > 0 ? labels.join(', ') : 'no option picked'
 
-    return `${tag(card, delivery)} ${card.title} → ${choice}.${noteOf(card)}`
+    return `${tag(card, delivery)} ${card.title} → ${choice}.${noteOf(card)}${onSlides}`
   }
 
   if (card.kind === 'share') {
-    if (!card.note.trim()) return undefined
+    if (!card.note.trim() && !onSlides) return undefined
 
-    return `${tag(card, delivery)} Change "${card.title}": ${card.note.trim()}`
+    return `${tag(card, delivery)} Change "${card.title}": ${card.note.trim() || 'see the notes on its images.'}${onSlides}`
   }
 
-  return `${tag(card, delivery)} Done: ${card.title}.${noteOf(card)} Retry what was blocked.`
+  return `${tag(card, delivery)} Done: ${card.title}.${noteOf(card)}${onSlides} Retry what was blocked.`
 }
 
 export const cantText = (card: HcpCard) =>
@@ -189,6 +236,62 @@ export function parseOptions(raw: unknown): HcpOption[] {
 
     return [{ value: o.value, label: o.label, ...(typeof o.hint === 'string' ? { hint: o.hint } : {}) }]
   })
+}
+
+export const IMAGE_FILE = /\.(png|jpe?g|gif|webp|heic|heif|tiff?|bmp)$/i
+export const VIDEO_FILE = /\.(mov|mp4|m4v|webm|mkv|avi)$/i
+export const isMediaFile = (path: string) => IMAGE_FILE.test(path) || VIDEO_FILE.test(path)
+
+/** A tool's `media` as Claude passed it: paths with optional captions, at most MAX_MEDIA. */
+export function parseMedia(raw: unknown): { path: string; caption?: string }[] {
+  if (!Array.isArray(raw)) return []
+
+  return raw
+    .flatMap(item => {
+      const m = (typeof item === 'string' ? { path: item } : item) as Record<string, unknown>
+      if (typeof m.path !== 'string' || !m.path.trim()) return []
+
+      return [{ path: m.path.trim(), ...(typeof m.caption === 'string' && m.caption.trim() ? { caption: m.caption.trim() } : {}) }]
+    })
+    .slice(0, MAX_MEDIA)
+}
+
+// A quoted path, a file:// URL, or a bare one starting at / or ~ with backslash escapes,
+// which is what dragging a file into a terminal or an editor field pastes.
+const PATHISH = /'([^']+)'|"([^"]+)"|(file:\/\/[^\s'"]+)|((?:~|\/)(?:\\.|[^\s'"\\])+)/g
+
+/** The image and video paths in what the person typed, and the words left around them. */
+export function splitPaths(text: string): { paths: string[]; rest: string } {
+  const paths: string[] = []
+  const rest = text.replace(PATHISH, (whole, single?: string, double?: string, url?: string, bare?: string) => {
+    let path = single ?? double ?? ''
+    if (url !== undefined) {
+      try {
+        path = decodeURIComponent(url.slice('file://'.length))
+      } catch {
+        return whole
+      }
+    }
+    if (bare !== undefined) path = bare.replace(/\\(.)/g, '$1').replace(/[,.;:)]+$/, '')
+    if (!isMediaFile(path)) return whole
+    if (!paths.includes(path)) paths.push(path)
+
+    return ''
+  })
+
+  return { paths, rest: rest.replace(/\s+/g, ' ').trim() }
+}
+
+/** The lines that hand Claude the person's pictures: paths it reads with Read. */
+export function attachedText(media: readonly HcpMedia[]): string {
+  if (media.length === 0) return ''
+  const lines = media.map(m => {
+    const about = [m.caption, m.video ? `a frame of ${m.video}` : ''].filter(Boolean).join(', ')
+
+    return `- ${m.path}${about ? ` (${about})` : ''}`
+  })
+
+  return `\nAttached, view each with Read before acting:\n${lines.join('\n')}`
 }
 
 // Local time is read through a fixed UTC offset in minutes (`date +%z` at start),

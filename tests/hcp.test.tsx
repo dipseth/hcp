@@ -9,6 +9,7 @@ import {
   nextWorkMorning,
   parseWhen,
   smartLater,
+  splitPaths,
 } from '../hooks/model'
 
 // The test runner has a real timer; the hooks environment's types don't name it.
@@ -50,6 +51,34 @@ const PANE = {
     view: {},
   },
 } as const
+
+/**
+ * Stands in for the host's files, sips and ffmpeg: every path exists unless it
+ * says "missing", a thumbnail is 640x400, and a video holds three frames.
+ */
+function pictures(on: On) {
+  const ran: string[][] = []
+  const done = (stdout = '') => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+  on('session.id', () => ({ value: 'session-1' }))
+  on('fs.stat', (_, e) =>
+    e.path.includes('missing') ? { deny: `ENOENT: ${e.path}` } : { value: { kind: 'file' as const, size: 10, mtimeMs: 0, isLink: false } },
+  )
+  on('fs.read', (_, e) => (e.as === 'bytes' ? { value: { base64: 'AAAA' } } : { deny: `ENOENT: ${e.path}` }))
+  on('fs.list', () => ({
+    value: ['frame-01.png', 'frame-02.png', 'frame-03.png'].map(name => ({ name, kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })),
+  }))
+  on('process.run', (_, e) => {
+    ran.push([...e.argv])
+    if (e.argv[0] === 'sips' && e.argv[1] === '-g') return done('pixelWidth: 640\npixelHeight: 400')
+    if (e.argv[0] === 'ffprobe') return done('9.0\n')
+
+    return done()
+  })
+
+  return ran
+}
+
+const shots = (count: number) => Array.from({ length: count }, (_, at) => ({ path: `/shots/shot-${at + 1}.png`, caption: `shot ${at + 1}` }))
 
 /** The card id from what the tool told Claude. */
 const idOf = (posted: { text?: string; result?: unknown }) =>
@@ -238,6 +267,114 @@ test("an hcp tool's raw result row is hidden, and other rows are left to the eng
     expect(await left.find({ type: 'Text', text: /engine row/ })).toBeDefined()
     await left.unmount()
   }
+})
+
+test('pictures on a card draw as Image on the terminal and Svg elsewhere', async ($, on) => {
+  const submitted = engine(on)
+  pictures(on)
+  await $.session.start({ cwd: '/', surface: 'vscode', isInteractive: true })
+
+  for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
+    const posted = await $.tool.call({
+      tool: 'mcp__hcp__ask',
+      title: 'Which layout?',
+      options: [
+        { value: 'a', label: 'A' },
+        { value: 'b', label: 'B' },
+      ],
+      media: [...shots(2), { path: '/shots/missing.png' }],
+    })
+    const card = { id: idOf(posted) }
+    expect(String(posted.result)).toMatch(/no such image or video file: \/shots\/missing\.png/)
+    const ui = await $.ui.mount({ ...PANE, surface })
+
+    const drawn = await ui.findAll({ type: surface === 'terminal' ? 'Image' : 'Svg' })
+    expect(drawn.length).toBe(2)
+    if (surface !== 'terminal') expect(String(drawn[0]?.props.source)).toContain('data:image/jpeg;base64,AAAA')
+    expect(await ui.find({ type: 'Text', text: /shot 2/ })).toBeDefined()
+    await ui.press({ key: `${card.id}-opt-b` })
+    await ui.press({ key: `${card.id}-send` })
+    expect(submitted[submitted.length - 1]).toBe(`[HCP ${card.id}] Which layout? → B.`)
+    await ui.unmount()
+  }
+})
+
+test('slides flip, keep a note per slide, and only the active card carries hotkeys', async ($, on) => {
+  const submitted = engine(on)
+  pictures(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const first = { id: idOf(await $.tool.call({ tool: 'mcp__hcp__share', title: 'Release note', text: 'Shipped', media: shots(6) })) }
+  const second = {
+    id: idOf(
+      await $.tool.call({
+        tool: 'mcp__hcp__ask',
+        title: 'Ship it?',
+        options: [
+          { value: 'yes', label: 'Yes' },
+          { value: 'no', label: 'No' },
+        ],
+      }),
+    ),
+  }
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+
+  expect((await ui.find({ key: `${first.id}-next` }))?.props.hotkey).toBe('l')
+  expect((await ui.find({ key: `${second.id}-opt-yes` }))?.props.hotkey).toBe(undefined)
+  expect(await ui.find({ type: 'Text', text: /Keys once the pane has focus/ })).toBeDefined()
+
+  // j moves the hotkeys to the next card, k back.
+  await ui.press({ key: 'nav-next' })
+  await settle()
+  expect((await ui.find({ key: `${second.id}-opt-yes` }))?.props.hotkey).toBe('1')
+  expect((await ui.find({ key: `${first.id}-next` }))?.props.hotkey).toBe(undefined)
+  await ui.press({ key: 'nav-prev' })
+  await settle()
+
+  await ui.press({ key: `${first.id}-next` })
+  expect(await ui.find({ type: 'Text', text: /^2\/6$/ })).toBeDefined()
+  await ui.input({ key: `${first.id}-slide-note-1`, text: 'crop the header' })
+  expect(await ui.find({ type: 'Text', text: /crop the header/ })).toBeDefined()
+  await ui.input({ key: `${first.id}-note`, text: 'Add the date' })
+  expect(submitted[0]).toBe(`[HCP ${first.id}] Change "Release note": Add the date On image 2 ("shot 2"): "crop the header"`)
+  await ui.unmount()
+})
+
+test('a picture dropped into the message field is attached, then sent with the next message', async ($, on) => {
+  const submitted = engine(on)
+  pictures(on)
+  await $.session.start({ cwd: '/', surface: 'vscode', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'vscode' })
+
+  await ui.input({ key: 'quick-0', text: "'/Users/me/shot one.png'" })
+  await settle()
+  expect(submitted).toEqual([])
+  expect(await ui.find({ type: 'Text', text: /Sent with your next message \(1\)/ })).toBeDefined()
+
+  await ui.input({ key: 'quick-1', text: 'what is off here?' })
+  await settle()
+  expect(submitted[0]).toBe('what is off here?\nAttached, view each with Read before acting:\n- /Users/me/shot one.png')
+  expect(await ui.find({ type: 'Text', text: /Sent with your next message/ })).toBe(undefined)
+  await ui.unmount()
+})
+
+test('a video on a card is sampled into captioned frames that play the video', async ($, on) => {
+  engine(on)
+  const ran = pictures(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const posted = await $.tool.call({ tool: 'mcp__hcp__handoff', title: 'Check the recording', media: [{ path: '/rec/demo.mov' }] })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  expect(ran.some(argv => argv[0] === 'ffmpeg' && argv.includes('/rec/demo.mov'))).toBe(true)
+  expect((await ui.findAll({ type: 'Svg' })).length).toBe(3)
+  expect(await ui.find({ type: 'Text', text: /demo\.mov at 1\.1s/ })).toBeDefined()
+  expect((await ui.find({ key: `${idOf(posted)}-open-0` }))?.props.label).toBe('▶ Play')
+  await ui.unmount()
+})
+
+test('typed text yields the image and video paths in it, quoted, escaped or as file URLs', () => {
+  expect(splitPaths("look '/a b/c.png' and /x/y\\ z.MOV, ok")).toEqual({ paths: ['/a b/c.png', '/x/y z.MOV'], rest: 'look and ok' })
+  expect(splitPaths('file:///tmp/s%20s.jpg')).toEqual({ paths: ['/tmp/s s.jpg'], rest: '' })
+  expect(splitPaths('see /etc/hosts and ~/d/p.webp.')).toEqual({ paths: ['~/d/p.webp'], rest: 'see /etc/hosts and' })
 })
 
 test('a share copies as paste-ready HTML and plain text, and MCP auth parses', () => {

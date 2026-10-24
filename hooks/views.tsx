@@ -3,9 +3,9 @@
 // goes through `Actions`, so these functions only read. The mode's color is
 // the inbox's accent, and each kind of card has its own.
 
-import type { ElementTable } from 'claude-code'
+import type { ElementTable, RenderSurface } from 'claude-code'
 
-import type { HcpCard, HcpDelivery, HcpMode, HcpScheduled } from '../types'
+import type { HcpCard, HcpDelivery, HcpMedia, HcpMode, HcpScheduled } from '../types'
 import { SERVICES, STEERS, clip } from './model'
 import type { Steer } from './model'
 
@@ -30,6 +30,15 @@ export type Actions = {
   sendQueued: (id: string) => void
   cancelQueued: (id: string) => void
   clearHistory: () => void
+  slide: (id: string, step: number) => void
+  /** Keystrokes in a slide's note field; `isKept` on Enter, which shows it under the slide. */
+  slideNote: (id: string, at: number, text: string, isKept?: boolean) => void
+  openMedia: (media: HcpMedia) => void
+  unattach: (at: number) => void
+  clearAttachments: () => void
+  clearFromYou: () => void
+  /** j/k: the next or previous open card takes the hotkeys and the focus. */
+  move: (step: number) => void
 }
 
 export type Snapshot = {
@@ -42,6 +51,24 @@ export type Snapshot = {
   /** MCP servers the engine says need authorizing. */
   needsAuth: string[]
   formatAt: (ms: number) => string
+  /** The open card that carries the hotkeys, if any is open. */
+  active: string | undefined
+  outbox: HcpMedia[]
+  fromYou: HcpMedia[]
+} & Pictures
+
+/** How pictures draw: the terminal's Image reads files, other surfaces' Svg carries bytes. */
+export type Pictures = {
+  surface: RenderSurface
+  /** Thumbnail base64 by thumbnail path, for the surfaces that draw an Svg. */
+  thumbs: ReadonlyMap<string, string>
+}
+
+/** What a card draws with besides itself. */
+export type CardContext = Pictures & {
+  laterLabel: string
+  /** This card carries the hotkeys: drawn in the pane, and the one j/k moved to. */
+  hasKeys?: boolean
 }
 
 export const THEME = {
@@ -105,6 +132,130 @@ function answeredRow(els: ElementTable, card: HcpCard) {
   )
 }
 
+const baseName = (path: string) => path.slice(path.lastIndexOf('/') + 1)
+
+const svgOf = (base64: string, width: number, height: number) =>
+  `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">` +
+  `<image href="data:image/jpeg;base64,${base64}" width="${width}" height="${height}" preserveAspectRatio="xMidYMid meet"/></svg>`
+
+/**
+ * One picture as the surface can draw it: the terminal's Image reading the png
+ * itself, an Svg carrying the jpeg elsewhere, or its caption where neither can.
+ */
+function picture(els: ElementTable, m: HcpMedia, on: Pictures, isSmall: boolean) {
+  const { Text } = els
+  const { surface, thumbs } = on
+  const alt = m.caption ?? baseName(m.path)
+  const ratio = m.width && m.height ? m.height / m.width : 0.6
+  // The resolved table names every element and a surface draws the ones it lacks as nothing,
+  // so the surface, not the table, says which picture element there is.
+  if (surface === 'terminal' && 'Image' in els) {
+    const { Image } = els
+    if (m.pngPath) {
+      const columns = isSmall ? 18 : 48
+      // A terminal cell is about twice as tall as it is wide.
+      const rows = Math.max(2, Math.min(40, Math.round((columns * ratio) / 2)))
+
+      return <Image source={{ file: m.pngPath, format: 'png' }} columns={columns} rows={rows} alt={alt} />
+    }
+  } else if (surface !== 'terminal' && 'Svg' in els) {
+    const { Svg } = els
+    const path = isSmall ? (m.miniPath ?? m.thumbPath) : m.thumbPath
+    const base64 = path === undefined ? undefined : thumbs.get(path)
+    if (base64 !== undefined) {
+      const width = isSmall ? 160 : Math.min(480, m.width ?? 480)
+      const height = Math.round(width * ratio)
+
+      return <Svg source={svgOf(base64, width, height)} alt={alt} width={width} height={height} />
+    }
+  }
+
+  return <Text dimColor>🖼 {clip(alt, 60)}</Text>
+}
+
+/** A card's pictures: one large, a grid of small ones, or slides with a note each. */
+function mediaBlock(els: ElementTable, card: HcpCard, act: Actions, ctx: CardContext) {
+  const media = card.media ?? []
+  if (media.length === 0) return null
+  const { Box, Text, Button } = els
+  const Input = 'Input' in els ? els.Input : undefined
+  const id = card.id
+  const key = (hotkey: string) => (ctx.hasKeys ? { hotkey } : {})
+
+  if (media.length === 1 || card.layout !== 'slides') {
+    const isSmall = media.length > 1
+
+    return (
+      <Box flexDirection="row" flexWrap="wrap" gap={1}>
+        {media.map((m, at) => (
+          <Box key={`${id}-media-${at}`} flexDirection="column">
+            {picture(els, m, ctx, isSmall)}
+            <Box flexDirection="row" gap={1}>
+              {m.caption && <Text dimColor>{clip(m.caption, isSmall ? 22 : 80)}</Text>}
+              <Button
+                key={`${id}-open-${at}`}
+                label={m.video ? '▶ Play' : '⤢ Open'}
+                plain
+                dimColor
+                {...(media.length === 1 ? key('o') : {})}
+                onPress={() => act.openMedia(m)}
+              />
+            </Box>
+          </Box>
+        ))}
+      </Box>
+    )
+  }
+
+  const at = Math.min(Math.max(card.slide ?? 0, 0), media.length - 1)
+  const m = media[at]!
+  const kept = card.slideNotes?.[String(at)]
+
+  return (
+    <Box flexDirection="column">
+      {picture(els, m, ctx, false)}
+      <Box flexDirection="row" flexWrap="wrap" gap={1}>
+        <Button key={`${id}-prev`} label="‹ prev" {...key('h')} onPress={() => act.slide(id, -1)} />
+        <Text bold>
+          {at + 1}/{media.length}
+        </Text>
+        <Button key={`${id}-next`} label="next ›" {...key('l')} onPress={() => act.slide(id, 1)} />
+        <Button key={`${id}-open`} label={m.video ? '▶ Play video' : '⤢ Open'} dimColor {...key('o')} onPress={() => act.openMedia(m)} />
+      </Box>
+      {m.caption && <Text dimColor>{m.caption}</Text>}
+      {kept && <Text dimColor>📝 {kept}</Text>}
+      {Input && (
+        <Input
+          key={`${id}-slide-note-${at}`}
+          placeholder={`Note on image ${at + 1} (optional), Enter keeps it`}
+          submitLabel="keep"
+          onInput={value => act.slideNote(id, at, value)}
+          onSubmit={value => act.slideNote(id, at, value, true)}
+        />
+      )}
+    </Box>
+  )
+}
+
+/** A row of small pictures with a remove button each, or one clear for the row. */
+function thumbRow(els: ElementTable, media: HcpMedia[], on: Pictures, prefix: string, remove?: (at: number) => void) {
+  const { Box, Text, Button } = els
+
+  return (
+    <Box flexDirection="row" flexWrap="wrap" gap={1}>
+      {media.map((m, at) => (
+        <Box key={`${prefix}-${at}`} flexDirection="column">
+          {picture(els, m, on, true)}
+          <Box flexDirection="row" gap={1}>
+            <Text dimColor>{clip(m.caption ?? baseName(m.path), 22)}</Text>
+            {remove && <Button key={`${prefix}-x-${at}`} label="×" plain dimColor onPress={() => remove(at)} />}
+          </Box>
+        </Box>
+      ))}
+    </Box>
+  )
+}
+
 /** The press landed and the engine holds the answer until Claude's running turn ends. */
 function queuedRow(els: ElementTable, card: HcpCard) {
   const { Box, Text } = els
@@ -121,7 +272,7 @@ function queuedRow(els: ElementTable, card: HcpCard) {
   )
 }
 
-export function cardView(els: ElementTable, card: HcpCard, act: Actions, laterLabel: string) {
+export function cardView(els: ElementTable, card: HcpCard, act: Actions, ctx: CardContext) {
   if (card.status === 'queued') return queuedRow(els, card)
   if (card.status !== 'open') return answeredRow(els, card)
 
@@ -130,6 +281,8 @@ export function cardView(els: ElementTable, card: HcpCard, act: Actions, laterLa
   const id = card.id
   const color = THEME[card.kind]
   const service = card.service === undefined ? undefined : SERVICES[card.service]
+  const laterLabel = ctx.laterLabel
+  const key = (hotkey: string) => (ctx.hasKeys ? { hotkey } : {})
   const later = (
     <Button key={`${id}-later`} label={`⏰ Later · ${laterLabel}`} onPress={() => act.answer(id, 'later')}>
       {big(els, `⏰ Later · ${laterLabel}`)}
@@ -139,7 +292,7 @@ export function cardView(els: ElementTable, card: HcpCard, act: Actions, laterLa
   const options =
     card.kind === 'ask' ? (
       <Box flexDirection="row" flexWrap="wrap" gap={1}>
-        {card.options.map(o => {
+        {card.options.map((o, at) => {
           const isPicked = card.picked.includes(o.value)
           const mark = isPicked ? '✓' : card.isMulti ? '☐' : '○'
 
@@ -148,6 +301,7 @@ export function cardView(els: ElementTable, card: HcpCard, act: Actions, laterLa
               key={`${id}-opt-${o.value}`}
               label={`${mark} ${o.label}`}
               variant={isPicked ? 'primary' : 'secondary'}
+              {...key(String(at + 1))}
               onPress={() => act.pick(id, o.value)}
             >
               {big(els, `${mark} ${o.label}`, isPicked ? color : undefined)}
@@ -178,7 +332,7 @@ export function cardView(els: ElementTable, card: HcpCard, act: Actions, laterLa
   const footer =
     card.kind === 'ask' ? (
       <Box flexDirection="row" flexWrap="wrap" gap={1}>
-        <Button key={`${id}-send`} label="Send" variant="primary" onPress={() => act.answer(id, 'now')}>
+        <Button key={`${id}-send`} label="Send" variant="primary" {...key('s')} onPress={() => act.answer(id, 'now')}>
           {big(els, '➤ Send', color)}
         </Button>
         <Button key={`${id}-nntr`} label="Noted · no reply" onPress={() => act.answer(id, 'nntr')}>
@@ -188,7 +342,7 @@ export function cardView(els: ElementTable, card: HcpCard, act: Actions, laterLa
       </Box>
     ) : card.kind === 'share' ? (
       <Box flexDirection="row" flexWrap="wrap" gap={1}>
-        <Button key={`${id}-copy-rich`} label="Copy formatted" variant="primary" onPress={() => act.copy(id, true)}>
+        <Button key={`${id}-copy-rich`} label="Copy formatted" variant="primary" {...key('s')} onPress={() => act.copy(id, true)}>
           {big(els, '📋 Copy formatted', color)}
         </Button>
         <Button key={`${id}-copy-plain`} label="Copy plain" onPress={() => act.copy(id, false)} />
@@ -196,7 +350,7 @@ export function cardView(els: ElementTable, card: HcpCard, act: Actions, laterLa
       </Box>
     ) : (
       <Box flexDirection="row" flexWrap="wrap" gap={1}>
-        <Button key={`${id}-done`} label="Done" variant="primary" onPress={() => act.done(id)}>
+        <Button key={`${id}-done`} label="Done" variant="primary" {...key('s')} onPress={() => act.done(id)}>
           {big(els, service ? '✓ Done · verify & retry' : '✓ Done', color)}
         </Button>
         {later}
@@ -215,17 +369,19 @@ export function cardView(els: ElementTable, card: HcpCard, act: Actions, laterLa
     <Box key={`card-${id}`} flexDirection="column" borderStyle="round" borderColor={color} paddingX={1}>
       <Box flexDirection="row" justifyContent="space-between">
         <Text>
+          {ctx.hasKeys && <Text color={color}>▸ </Text>}
           {badge(els, id, color)}{' '}
           <Text weight="bold" size="title">
             {card.kind === 'handoff' ? '⛔ ' : ''}
             {card.title}
           </Text>
         </Text>
-        <Button key={`${id}-x`} label="×" role="dismiss" plain dimColor onPress={() => act.dismiss(id)} />
+        <Button key={`${id}-x`} label="×" role="dismiss" plain dimColor {...key('x')} onPress={() => act.dismiss(id)} />
       </Box>
       {card.detail && <Text dimColor>{card.detail}</Text>}
       {card.audience && <Text dimColor>For: {card.audience}</Text>}
       {card.draft && <Markdown text={card.draft} />}
+      {mediaBlock(els, card, act, ctx)}
       {options}
       {hints.map(o => (
         <Text dimColor>
@@ -263,6 +419,8 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
   // Queued cards keep their place in the list, so the ⏳ shows where the buttons were.
   const live = s.cards.filter(c => c.status === 'open' || c.status === 'queued')
   const recent = s.cards.filter(c => c.status === 'answered' || c.status === 'dismissed').slice(-5)
+  // The terminal is where the keys are the way in.
+  const isTerminal = s.surface === 'terminal'
   const section = (title: string) => (
     <Text size="heading" weight="bold" color={accent}>
       {title}
@@ -305,17 +463,29 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
       )}
 
       <Box flexDirection="column">
-        {section(open.length === 0 ? 'Nothing waiting on you' : `Waiting on you (${open.length})`)}
-        {live.map(card => cardView(els, card, act, s.laterLabel))}
+        <Box flexDirection="row" gap={1}>
+          {section(open.length === 0 ? 'Nothing waiting on you' : `Waiting on you (${open.length})`)}
+          {open.length > 1 && <Button key="nav-prev" label="↑ k" plain dimColor hotkey="k" onPress={() => act.move(-1)} />}
+          {open.length > 1 && <Button key="nav-next" label="↓ j" plain dimColor hotkey="j" onPress={() => act.move(1)} />}
+        </Box>
+        {isTerminal && open.length > 0 && (
+          <Text dimColor>
+            Keys once the pane has focus (ctrl+x tab, or /hcp; Tab off a text field first): j/k card · 1-8 pick · s send ·
+            x dismiss · h/l slide · o open · y/n reply
+          </Text>
+        )}
+        {live.map(card =>
+          cardView(els, card, act, { surface: s.surface, laterLabel: s.laterLabel, thumbs: s.thumbs, hasKeys: card.id === s.active }),
+        )}
       </Box>
 
       <Box flexDirection="column">
         {section("Reply to Claude's last message")}
         <Box flexDirection="row" flexWrap="wrap" gap={1}>
-          <Button key="q-yes" label="Yes" variant="primary" onPress={() => act.quick('yes')}>
+          <Button key="q-yes" label="Yes" variant="primary" hotkey="y" onPress={() => act.quick('yes')}>
             {big(els, '👍 Yes', accent)}
           </Button>
-          <Button key="q-no" label="No" onPress={() => act.quick('no')}>
+          <Button key="q-no" label="No" hotkey="n" onPress={() => act.quick('no')}>
             {big(els, '👎 No')}
           </Button>
           <Button key="q-yes-nntr" label="Yes · NNTR" onPress={() => act.quick('yes-nntr')}>
@@ -331,11 +501,20 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
         {Input && (
           <Input
             key={`quick-${s.quickSent}`}
-            placeholder="Message for Claude, Enter sends now"
+            placeholder="Message for Claude, Enter sends now (drop an image or video file in to attach it)"
             submitLabel="send"
             onInput={act.quickDraft}
             onSubmit={value => act.quickSend('now', value)}
           />
+        )}
+        {s.outbox.length > 0 && (
+          <Box flexDirection="column">
+            <Box flexDirection="row" gap={1}>
+              <Text color={accent}>📎 Sent with your next message ({s.outbox.length})</Text>
+              <Button key="outbox-clear" label="Clear" plain dimColor onPress={act.clearAttachments} />
+            </Box>
+            {thumbRow(els, s.outbox, s, 'outbox', act.unattach)}
+          </Box>
         )}
         {Input && (
           <Box flexDirection="row" gap={1}>
@@ -375,6 +554,16 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
               <Button key={`${item.id}-cancel`} label="Cancel" dimColor onPress={() => act.cancelQueued(item.id)} />
             </Box>
           ))}
+        </Box>
+      )}
+
+      {s.fromYou.length > 0 && (
+        <Box flexDirection="column">
+          <Box flexDirection="row" gap={1}>
+            {section('You sent')}
+            <Button key="from-you-clear" label="Clear" plain dimColor onPress={act.clearFromYou} />
+          </Box>
+          {thumbRow(els, s.fromYou, s, 'from-you')}
         </Box>
       )}
 
