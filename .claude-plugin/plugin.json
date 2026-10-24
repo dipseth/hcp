@@ -1,0 +1,6 @@
+{
+  "name": "hcp",
+  "version": "0.1.0",
+  "description": "Human Context Protocol: clickable cards, ticket pickers, handoffs and no-reply notes between you and Claude",
+  "types": "./types/index.d.ts"
+}
