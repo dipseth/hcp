@@ -105,7 +105,24 @@ function answeredRow(els: ElementTable, card: HcpCard) {
   )
 }
 
+/** The press landed and the engine holds the answer until Claude's running turn ends. */
+function queuedRow(els: ElementTable, card: HcpCard) {
+  const { Box, Text } = els
+  const color = THEME[card.kind]
+  const what = card.answer?.replace(/^\[HCP [^\]]*\]\s*/, '') ?? ''
+
+  return (
+    <Box key={`card-${card.id}`} flexDirection="column" borderStyle="round" borderColor={color} paddingX={1}>
+      <Text>
+        {badge(els, card.id, color)} <Text color={color}>⏳ Queued</Text> <Text dimColor>{clip(what || card.title, 90)}</Text>
+      </Text>
+      <Text dimColor>Claude picks it up when its current turn ends. No need to press again.</Text>
+    </Box>
+  )
+}
+
 export function cardView(els: ElementTable, card: HcpCard, act: Actions, laterLabel: string) {
+  if (card.status === 'queued') return queuedRow(els, card)
   if (card.status !== 'open') return answeredRow(els, card)
 
   const { Box, Text, Button, Markdown } = els
@@ -243,7 +260,9 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
   const Input = 'Input' in els ? els.Input : undefined
   const accent = THEME[s.mode]
   const open = s.cards.filter(c => c.status === 'open')
-  const recent = s.cards.filter(c => c.status !== 'open').slice(-5)
+  // Queued cards keep their place in the list, so the ⏳ shows where the buttons were.
+  const live = s.cards.filter(c => c.status === 'open' || c.status === 'queued')
+  const recent = s.cards.filter(c => c.status === 'answered' || c.status === 'dismissed').slice(-5)
   const section = (title: string) => (
     <Text size="heading" weight="bold" color={accent}>
       {title}
@@ -287,7 +306,7 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
 
       <Box flexDirection="column">
         {section(open.length === 0 ? 'Nothing waiting on you' : `Waiting on you (${open.length})`)}
-        {open.map(card => cardView(els, card, act, s.laterLabel))}
+        {live.map(card => cardView(els, card, act, s.laterLabel))}
       </Box>
 
       <Box flexDirection="column">

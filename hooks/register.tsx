@@ -54,6 +54,17 @@ const drafts = new Map<string, string>()
 let quickDraftText = ''
 // Bash calls that raised a handoff: their result rows draw the card.
 const handoffCalls = new Set<string>()
+// Cards whose press is being handled: a second press before the state lands does nothing.
+const busy = new Set<string>()
+// Whether a main-conversation turn is running: a prompt submitted now queues behind it.
+let isTurnRunning = false
+
+const QUEUED_TOAST = "Queued: Claude picks it up when its current turn ends. The card shows ⏳ until then."
+
+/** What to tell the person after a prompt was handed to the engine. */
+function sentToast(wasQueued: boolean) {
+  return wasQueued ? QUEUED_TOAST : 'Sent.'
+}
 
 function patchCard($: Engine, id: string, fn: (card: HcpCard) => HcpCard) {
   return update($, cards, list => list.map(c => (c.id === id ? fn(c) : c)))
@@ -224,6 +235,16 @@ async function copyShare($: Engine, id: string, isRich: boolean) {
 }
 
 async function answer($: Engine, id: string, delivery: HcpDelivery, note?: string, suffix = '') {
+  if (busy.has(id)) return
+  busy.add(id)
+  try {
+    await answerCard($, id, delivery, note, suffix)
+  } finally {
+    busy.delete(id)
+  }
+}
+
+async function answerCard($: Engine, id: string, delivery: HcpDelivery, note?: string, suffix = '') {
   const card = await findCard($, id)
   if (!card || card.status !== 'open') return
   const withNote = { ...card, note: note ?? drafts.get(id) ?? card.note }
@@ -246,20 +267,38 @@ async function answer($: Engine, id: string, delivery: HcpDelivery, note?: strin
   }
   const full = text + suffix
 
+  drafts.delete(id)
   if (delivery === 'later') {
     const when = await later($)
     await schedule($, { kind: 'prompt', text: full, dueAt: when.dueAt, cardId: id })
     $.ui.toast(`Will send ${when.label}.`)
-  } else {
+  } else if (delivery === 'nntr') {
     await deliver($, full, delivery, card.agentId)
-    $.ui.toast(delivery === 'nntr' ? 'Noted. Claude sees it without replying.' : 'Sent.')
+    $.ui.toast('Noted. Claude sees it without replying.')
+  } else {
+    // The card turns ⏳ before the engine is asked: a prompt submitted mid-turn resolves
+    // only once the running turn ends, and the person must see the press landed.
+    const wasQueued = isTurnRunning
+    await patchCard($, id, c => ({ ...c, note: withNote.note, status: 'queued', delivery, answer: full, progress: undefined }))
+    await refreshStatus($)
+    $.ui.toast(sentToast(wasQueued))
+    await deliver($, full, delivery, card.agentId)
   }
-  drafts.delete(id)
   await patchCard($, id, c => ({ ...c, note: withNote.note, status: 'answered', delivery, answer: full, progress: undefined }))
   await refreshStatus($)
 }
 
 async function verifyAndSend($: Engine, id: string) {
+  if (busy.has(id)) return
+  busy.add(id)
+  try {
+    await verifyThenAnswer($, id)
+  } finally {
+    busy.delete(id)
+  }
+}
+
+async function verifyThenAnswer($: Engine, id: string) {
   const card = await findCard($, id)
   if (card?.service?.startsWith('mcp:')) {
     const server = card.service.slice(4)
@@ -269,13 +308,13 @@ async function verifyAndSend($: Engine, id: string) {
 
       return
     }
-    await answer($, id, 'now', undefined, isListed ? '' : ` (${server} is no longer listed as needing auth.)`)
+    await answerCard($, id, 'now', undefined, isListed ? '' : ` (${server} is no longer listed as needing auth.)`)
 
     return
   }
   const service = card?.service === undefined ? undefined : SERVICES[card.service]
   if (!card || !service) {
-    await answer($, id, 'now')
+    await answerCard($, id, 'now')
 
     return
   }
@@ -288,9 +327,9 @@ async function verifyAndSend($: Engine, id: string) {
 
       return
     }
-    await answer($, id, 'now', undefined, ` (Verified: \`${service.verify.join(' ')}\` passed.)`)
+    await answerCard($, id, 'now', undefined, ` (Verified: \`${service.verify.join(' ')}\` passed.)`)
   } catch {
-    await answer($, id, 'now', undefined, " (The mod couldn't run the check itself.)")
+    await answerCard($, id, 'now', undefined, " (The mod couldn't run the check itself.)")
   }
 }
 
@@ -346,14 +385,20 @@ function actionsFor($: Engine): Actions {
       ),
     cant: id =>
       void (async () => {
-        const card = await findCard($, id)
-        if (!card || card.status !== 'open') return
-        const withNote = { ...card, note: drafts.get(id) ?? card.note }
-        const text = cantText(withNote)
-        await deliver($, text, 'nntr', card.agentId)
-        await patchCard($, id, c => ({ ...c, note: withNote.note, status: 'answered', delivery: 'nntr', answer: text }))
-        $.ui.toast("Claude will work around it.")
-        await refreshStatus($)
+        if (busy.has(id)) return
+        busy.add(id)
+        try {
+          const card = await findCard($, id)
+          if (!card || card.status !== 'open') return
+          const withNote = { ...card, note: drafts.get(id) ?? card.note }
+          const text = cantText(withNote)
+          await deliver($, text, 'nntr', card.agentId)
+          await patchCard($, id, c => ({ ...c, note: withNote.note, status: 'answered', delivery: 'nntr', answer: text }))
+          $.ui.toast('Claude will work around it.')
+          await refreshStatus($)
+        } finally {
+          busy.delete(id)
+        }
       })(),
     setMode: next =>
       void (async () => {
@@ -374,8 +419,10 @@ function actionsFor($: Engine): Actions {
       ),
     quick: kind =>
       void (async () => {
-        if (kind === 'yes' || kind === 'no') await deliver($, kind === 'yes' ? 'Yes.' : 'No.', 'now')
-        else {
+        if (kind === 'yes' || kind === 'no') {
+          $.ui.toast(sentToast(isTurnRunning))
+          await deliver($, kind === 'yes' ? 'Yes.' : 'No.', 'now')
+        } else {
           const text = kind === 'ack' ? '👍 Seen.' : kind === 'yes-nntr' ? 'Yes.' : 'No.'
           await deliver($, `[HCP · NNTR] ${text}`, 'nntr')
           $.ui.toast('Noted. Claude sees it without replying.')
@@ -391,6 +438,8 @@ function actionsFor($: Engine): Actions {
           return
         }
         quickDraftText = ''
+        // The field clears before the engine is asked, since a mid-turn prompt resolves late.
+        await update($, quickSent, n => n + 1)
         if (delivery === 'later') {
           const when = await later($)
           await schedule($, { kind: 'prompt', text, dueAt: when.dueAt })
@@ -399,9 +448,9 @@ function actionsFor($: Engine): Actions {
           await deliver($, `[HCP · NNTR] ${text}`, 'nntr')
           $.ui.toast('Noted. Claude sees it without replying.')
         } else {
+          $.ui.toast(sentToast(isTurnRunning))
           await deliver($, text, 'now')
         }
-        await update($, quickSent, n => n + 1)
       })(),
     sendQueued: id =>
       void (async () => {
@@ -470,6 +519,18 @@ export const register: Register = on => {
     }
     for (const item of await read($, queue)) await arm($, item)
     await refreshStatus($)
+
+    return next(e)
+  })
+
+  // Whether the main conversation is mid-turn decides what a press is told: sent, or queued.
+  on('turn.start', async ($, e, next) => {
+    if (e.agentId === undefined) isTurnRunning = true
+
+    return next(e)
+  })
+  on('turn.complete', async ($, e, next) => {
+    if (e.agentId === undefined) isTurnRunning = false
 
     return next(e)
   })

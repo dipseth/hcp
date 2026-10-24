@@ -11,6 +11,9 @@ import {
   smartLater,
 } from '../hooks/model'
 
+// The test runner has a real timer; the hooks environment's types don't name it.
+declare const setTimeout: (fn: () => void, ms: number) => unknown
+const settle = () => new Promise<void>(resolve => setTimeout(resolve, 50))
 
 /** Stands in for the engine beneath the plugin, and records what it was asked to send. */
 function engine(on: On) {
@@ -78,6 +81,49 @@ test('an ask card draws in the pane and sends the pick, on every surface', async
     expect(await ui.find({ type: 'Text', text: /\(sent\)/ })).toBeDefined()
     await ui.unmount()
   }
+})
+
+test('a press mid-turn shows the card as queued at once and ignores repeat presses', async ($, on) => {
+  const submitted: string[] = []
+  let release = () => {}
+  const held = new Promise<void>(resolve => (release = resolve))
+  on('tool.register', (_, e) => ({ value: { tool: `mcp__hcp__${e.name}` } }))
+  on('command.register', (_, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.panes', () => ({ value: [] }))
+  on('ui.status', () => ({ value: undefined }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.notify', () => ({ value: { isSent: false as const, reason: 'no-surface' as const } }))
+  mock.clock(on, { now: Date.UTC(2026, 9, 22, 16, 0) })
+  mock.env(on, { HOME: '/nonexistent' })
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  // A prompt submitted while Claude works resolves only once the running turn ends.
+  on('prompt.submit', async (_, e) => {
+    submitted.push(e.text)
+    await held
+
+    return { text: e.text }
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const posted = await $.tool.call({ tool: 'mcp__hcp__handoff', title: 'Sign in to the VPN' })
+  const card = { id: idOf(posted) }
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  void ui.press({ key: `${card.id}-done` })
+  void ui.press({ key: `${card.id}-done` })
+  void ui.press({ key: `${card.id}-done` })
+  await settle()
+
+  expect(submitted.length).toBe(1)
+  expect(await ui.find({ type: 'Text', text: /Queued/ })).toBeDefined()
+  expect(await ui.find({ key: `${card.id}-done` })).toBe(undefined)
+  expect(await ui.find({ type: 'Text', text: /Nothing waiting on you/ })).toBeDefined()
+
+  release()
+  await settle()
+  expect(submitted.length).toBe(1)
+  expect(await ui.find({ type: 'Text', text: /\(sent\)/ })).toBeDefined()
+  await ui.unmount()
 })
 
 test('Noted sends no prompt and appends a note Claude reads', async ($, on) => {

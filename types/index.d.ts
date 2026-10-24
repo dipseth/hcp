@@ -27,7 +27,8 @@ export type HcpCard = {
   note: string
   /** A transient line under the card: verifying, still failing, running login. */
   progress?: string
-  status: 'open' | 'answered' | 'dismissed'
+  /** `queued`: the answer is handed to the engine and waits behind Claude's running turn. */
+  status: 'open' | 'queued' | 'answered' | 'dismissed'
   delivery?: HcpDelivery
   answer?: string
   createdAt: number
