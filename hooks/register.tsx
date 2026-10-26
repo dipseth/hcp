@@ -8,6 +8,7 @@ import type { EngineInterface, Register, RenderSurface } from 'claude-code'
 
 import type { HcpApproval, HcpCard, HcpDecision, HcpDelivery, HcpGrant, HcpMedia, HcpMode, HcpOutward, HcpScheduled } from '../types'
 import { bindSession, loadHistory, pipelineTool, resolved, shadow, shadowReport } from './decide'
+import { useOptions } from './langfuse'
 import { existing, expandAll, pastedImages, prepare, saveBytes, thumbnails } from './media'
 import { appendLedger, generatePort, initObservability, reachPorts, scoresPort } from './ports'
 import type { Judged } from './ports'
@@ -964,7 +965,8 @@ async function loadExtensions($: Engine) {
   if (problems.length > 0) $.ui.toast(`hcp extension: ${problems.join('; ')}`, { timeoutMs: 15_000 })
 }
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  useOptions(options)
   on('session.start', async ($, e, next) => {
     try {
       const zone = await $.process.run(['date', '+%z'], { timeoutMs: 5000 })

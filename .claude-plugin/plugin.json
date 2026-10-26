@@ -1,6 +1,34 @@
 {
   "name": "hcp",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Human Context Protocol: clickable cards, handoffs, no-reply notes, and a reach contract that holds calls contacting people for your OK",
-  "types": "./types/index.d.ts"
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "typesafe_api_key": {
+      "type": "string",
+      "title": "Jev API key",
+      "description": "Judges calls the reach rules can't place. Optional: without it the session's haiku judges instead.",
+      "sensitive": true,
+      "required": false
+    },
+    "langfuse_public_key": {
+      "type": "string",
+      "title": "Langfuse public key",
+      "description": "Optional. With all three Langfuse fields set, every run is a trace and every card answer a score.",
+      "required": false
+    },
+    "langfuse_secret_key": {
+      "type": "string",
+      "title": "Langfuse secret key",
+      "description": "Optional. Pairs with the public key.",
+      "sensitive": true,
+      "required": false
+    },
+    "langfuse_base_url": {
+      "type": "string",
+      "title": "Langfuse URL",
+      "description": "Optional. Your Langfuse region, e.g. https://us.cloud.langfuse.com.",
+      "required": false
+    }
+  }
 }

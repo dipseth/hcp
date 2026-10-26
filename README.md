@@ -62,7 +62,7 @@ How a call is sorted is a [decision pipeline](https://github.com/dipseth/decisio
 3. **A code gate turns the probabilities into pass, badge, grant or hold.** The thresholds are data, recorded on every run.
 4. **Each card answer is feedback on the gate.** Run records and answers go to `~/.claude/hcp/ledger/<date>.jsonl`, so the thresholds can be re-tuned from the records alone.
 
-The Jev key is `HCP_TYPESAFE_API_KEY`, read from the session's environment or its line in `~/.claude/.env`. It never appears on a card, in a prompt or in the ledger. Token-like strings are redacted before anything goes to Jev, and Jev sees only the channel, the audience and the content.
+The Jev key is `HCP_TYPESAFE_API_KEY`. hcp looks for it in the session's environment first, then the plugin's settings (`typesafe_api_key`), then its line in `~/.claude/.env`. It never appears on a card, in a prompt or in the ledger. Token-like strings are redacted before anything goes to Jev, and Jev sees only the channel, the audience and the content.
 
 Calibration on `tests/fixtures/reach-calls.json` (jev-1.14.0, 2026-10-26):
 - **Reach:** 10/10 notifying calls held, with 1 false hold in 18 (creating a pull request).
@@ -96,7 +96,11 @@ There are two scopes:
 
 ## Observability
 
-With `HCP_LANGFUSE_PUBLIC_KEY`, `HCP_LANGFUSE_SECRET_KEY` and `HCP_LANGFUSE_BASE_URL` set (in the environment or `~/.claude/.env`), every run, whether reach, surface or one Claude wrote, is a Langfuse trace with a span per node. Every card answer is a score on that trace (`hold_needed`, `surfaced_right`). Langfuse is best effort: the local ledger keeps everything regardless.
+With `HCP_LANGFUSE_PUBLIC_KEY`, `HCP_LANGFUSE_SECRET_KEY` and `HCP_LANGFUSE_BASE_URL` set (in the environment, the plugin's settings or `~/.claude/.env`), every run, whether reach, surface or one Claude wrote, is a Langfuse trace with a span per node. Every card answer is a score on that trace (`hold_needed`, `surfaced_right`). Langfuse is best effort: the local ledger keeps everything regardless.
+
+### Keys on every host
+
+The keys can't ship in this public repo, so `plugin.json` declares them as `userConfig`: `typesafe_api_key`, `langfuse_public_key`, `langfuse_secret_key` and `langfuse_base_url`, all optional. Claude Code asks for them once on each host where the plugin is enabled, or you can set them in `/config`. The two secret keys go in the system keychain, and the other two in `settings.json` under `pluginConfigs.hcp.options`. For a cloud session on claude.ai/code, set the `HCP_*` variables in that environment's settings instead. An environment variable wins over the plugin's settings for the same key.
 
 ## Extending it for your environment
 

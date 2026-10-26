@@ -874,3 +874,35 @@ test('with Langfuse set, a run is a trace with a span per node, and the card ans
   const score = posts.find(p => p.url === 'https://lf.example.com/api/public/scores')!
   expect(score.body).toMatchObject({ traceId, name: 'hold_needed', value: 1, dataType: 'BOOLEAN' })
 })
+
+test('with no environment, the Jev key comes from the plugin settings', { options: { typesafe_api_key: 'apikey_FROMCONFIG' } }, async ($, on) => {
+  engine(on, { HOME: '/home/me' })
+  tools(on)
+  ledger(on)
+  const sent = jev(on, {})
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'curl -X POST https://hooks.example.com -d x' })
+  expect(sent[0]?.headers.authorization).toBe('Bearer apikey_FROMCONFIG')
+})
+
+test(
+  'Langfuse keys from the plugin settings turn tracing on, and the environment wins over them',
+  { options: { langfuse_public_key: 'pk-cfg', langfuse_secret_key: 'sk-cfg', langfuse_base_url: 'https://lf.example.com' } },
+  async ($, on) => {
+    engine(on, { ...KEYED, HCP_LANGFUSE_SECRET_KEY: 'sk-env' })
+    tools(on)
+    ledger(on)
+    const posts: { url: string; auth: string }[] = []
+    on('http.fetch', (_, e) => {
+      posts.push({ url: e.url, auth: e.init?.headers?.authorization ?? '' })
+
+      return { value: { status: 207, ok: true, headers: {}, text: '{}' } }
+    })
+    await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+    await $.tool.call({ tool: 'Bash', command: COMMENT })
+    await settle()
+
+    const batch = posts.find(p => p.url === 'https://lf.example.com/api/public/ingestion')
+    expect(batch?.auth).toBe('Basic cGstY2ZnOnNrLWVudg==') // base64("pk-cfg:sk-env")
+  },
+)
