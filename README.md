@@ -41,6 +41,35 @@ Clickable seams between you and Claude, so a decision is a click instead of a pa
 
 Scheduled messages live as long as the session: closing it drops them.
 
+## Reach: calls that contact people
+
+Every tool call is sorted by who it reaches: **local** (this machine), **own** (your accounts, nobody told), **shared** (others can see it), **notifies** (a person gets a message).
+
+- **notifies** calls are held. The call fails for Claude with "[hcp] Held … card r<n>", and a reach card shows the exact content and who it goes to. You can answer:
+  - **Send**: Claude makes the same call again. That exact call runs once, and Claude Code doesn't ask permission a second time.
+  - **Send · allow similar 1h** or **… for today**: also opens a grant.
+  - **Save as draft**.
+  - **Not now**.
+  - Or type a change.
+- **shared** calls run with a badge on the tool row, for example `↗ git push · origin main · others can see`. **local** and **own** calls run untouched.
+- **A grant** lets later calls through without a card, until it expires. A call qualifies only when it uses the same channel (`gh issue comment`), reaches nobody outside the grant's audience, and the judge finds it the same kind of message with no new sensitive material. Anything less gets a card. The pane lists grants with a countdown and **Revoke**, and lists everything outward this session.
+- **Claude reads the contract first.** The protocol and the descriptions of tools that notify people say so, so Claude makes the call and lets hcp ask, instead of asking twice.
+
+How a call is sorted is a [decision pipeline](https://github.com/dipseth/decision-pipeline) (`hooks/reach.ts`): models estimate, code decides, your answers correct it later.
+
+1. **Rules and your tags settle most calls with no network.** Examples: Read and Edit are local; `gh issue|pr comment`, mail and chat webhooks notify; `git push` is shared; an MCP tool named `send_*`, or one that sets an assignee, notifies.
+2. **Jev judges what the rules can't place**: an untagged MCP write, `curl -X POST`, `gh api -X`. It's one request of four yes/no questions, taking about 200 ms and costing about $0.00002. If Jev fails, the session's haiku answers the same questions. If nobody answers, the call is badged "reach unknown", not held.
+3. **A code gate turns the probabilities into pass, badge, grant or hold.** The thresholds are data, recorded on every run.
+4. **Each card answer is feedback on the gate.** Run records and answers go to `~/.claude/hcp/ledger/<date>.jsonl`, so the thresholds can be re-tuned from the records alone.
+
+The Jev key is `HCP_TYPESAFE_API_KEY`, read from the session's environment or its line in `~/.claude/.env`. It never appears on a card, in a prompt or in the ledger. Token-like strings are redacted before anything goes to Jev, and Jev sees only the channel, the audience and the content.
+
+Calibration on `tests/fixtures/reach-calls.json` (jev-1.14.0, 2026-10-26):
+- **Reach:** 10/10 notifying calls held, with 1 false hold in 18 (creating a pull request).
+- **Grants:** none passed that shouldn't have; 1–2 of the 4 that should pass were held at the edges.
+
+The sample is small, so treat the thresholds as a start and re-run `node build/calibrate.ts` as the fixtures grow.
+
 ## Extending it for your environment
 
 The base knows one watched login (gcloud/bq) and generic wording. An environment adds its own in a JSON extension file, without forking the code. hcp reads `~/.claude/hcp.json` at session start, or the files named in `HCP_EXTENSIONS` (paths joined by `:`, layered in order, a later one winning). Each key is optional:
@@ -60,7 +89,9 @@ The base knows one watched login (gcloud/bq) and generic wording. An environment
   "tools": {
     "share": { "append": "Usually for Teams.", "properties": { "audience": "Teams channel or email." } }
   },
-  "labels": { "copyRich": "Copy for Teams" }
+  "labels": { "copyRich": "Copy for Teams" },
+  "reach": { "mcp__claude_ai_GroceryTrack__*": "local", "mcp__teams__post_message": "notifies", "bash:^make release": "shared" },
+  "judge": "jev"
 }
 ```
 
@@ -68,6 +99,8 @@ The base knows one watched login (gcloud/bq) and generic wording. An environment
 - **services**: CLIs whose expired login raises a handoff. `pattern` is matched, case-insensitively, against the failed Bash output; `command`, if given, must match the Bash command too; `fix` is what the person runs; `verify` is a read-only command that exits 0 once credentials work; `"runnable": true` lets the card's **Run it** start `fix` itself (only for logins that need no terminal). The same name as a base service replaces it. Claude's protocol and the handoff tool's description list every watched login.
 - **tools**: per tool (`ask`, `handoff`, `share`), text appended to its description and replacement descriptions for its properties.
 - **labels**: `copyRich`, the share card's formatted-copy button.
+- **reach**: a tool name (`*` matches anything) or `bash:<regex>` against a Bash command, and the level hcp gives it: `local`, `own`, `shared` or `notifies`. A tag beats the built-in rules and the judge; a later file's tags win.
+- **judge**: who estimates what rules and tags can't place: `jev` (the default, falling back to haiku), `haiku`, or `off` (rules and tags alone; unknown calls are badged).
 
 A malformed file, or a named one that can't be read, is reported in a toast and skipped.
 
@@ -90,3 +123,5 @@ To have it on every machine signed in to your claude.ai account, add `dipseth/hc
 ## Developing
 
 Clone it and name the folder in `CLAUDE_CODE_PLUGIN_DIRS` in `~/.claude/settings.json`, or start a session with `claude --plugin-dir <folder>`. Run `claude plugin test` and `claude plugin validate` on the folder.
+
+`hooks/vendor/dp.js` is the decision-pipeline core and zod, bundled with `build/bundle.sh <decision-pipeline checkout>` (after `npm install` there). A hooks module can only import its own files and has no Node, so `node:crypto` is swapped for a pure-JS shim. `hooks/vendor/dp.d.ts` types the parts hcp uses. `node build/calibrate.ts` runs the fixtures through Jev and prints what the thresholds would do.

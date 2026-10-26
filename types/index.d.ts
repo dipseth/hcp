@@ -25,10 +25,34 @@ export type HcpMedia = {
 /** How an answer reaches Claude: a prompt now, a silent note, or a prompt at `dueAt`. */
 export type HcpDelivery = 'now' | 'nntr' | 'later'
 
+/** `local`: this machine. `own`: the person's accounts, nobody told. `shared`: others see it. `notifies`: a person gets a message. */
+export type ReachLevel = 'local' | 'own' | 'shared' | 'notifies'
+
+/** A held call that reaches people, as its card shows it. */
+export type HcpReach = {
+  tool: string
+  /** `gh issue comment`, `weReci send_recipe_email`. */
+  channel: string
+  audience: string[]
+  level: ReachLevel
+  /** Why hcp thinks so: the rule, the tag, or the judge's numbers. */
+  why: string
+  /** What goes out, redacted and clipped. */
+  content: string
+  /** The exact call: Send approves this key once. */
+  callKey: string
+  /** The reach run that held it: the card's answer is its feedback. */
+  runId?: string
+  /** The grant it nearly fit, by id. */
+  nearGrant?: string
+}
+
 export type HcpCard = {
-  /** `c<n>` for asks and shares, `h<n>` for handoffs; what Claude refers to. */
+  /** `c<n>` for asks and shares, `h<n>` for handoffs, `r<n>` for held calls; what Claude refers to. */
   id: string
-  kind: 'ask' | 'handoff' | 'share'
+  kind: 'ask' | 'handoff' | 'share' | 'reach'
+  /** Reach: the held call. */
+  reach?: HcpReach
   /** The tool call that posted it, or the Bash call whose failure raised it. */
   toolUseId?: string
   /** The subagent whose call raised it; its notes go to that loop. */
@@ -72,6 +96,41 @@ export type HcpScheduled = {
   cardId?: string
 }
 
+/** Standing approval for calls like one the person sent, on one channel, to one audience. */
+export type HcpGrant = {
+  id: string
+  channel: string
+  audience: string[]
+  /** A model's one line on what kind of message it covers; the example's start until written. */
+  intent: string
+  /** The approved call's content, redacted and clipped. */
+  example: string
+  cardId: string
+  createdAt: number
+  expiresAt: number
+  uses: number
+}
+
+/** A call that left the machine this session, or was held: the pane's ledger and the row badge. */
+export type HcpOutward = {
+  toolUseId: string
+  at: number
+  tool: string
+  channel: string
+  audience: string[]
+  /** Absent when nothing could tell. */
+  level?: ReachLevel
+  verdict: 'pass' | 'badge' | 'grant' | 'hold' | 'approved'
+  why: string
+  grantId?: string
+  cardId?: string
+  /** Which judge answered: `jev`, `haiku`, `rules`, `none`. */
+  judgedBy?: string
+}
+
+/** Send on a reach card: this exact call may run once, until `expiresAt`. */
+export type HcpApproval = { callKey: string; cardId: string; expiresAt: number }
+
 export type HcpMode = 'pairing' | 'heads-down' | 'away'
 
 declare module 'claude-code' {
@@ -90,6 +149,9 @@ declare module 'claude-code' {
       outbox: HcpMedia[]
       /** Pictures the person pasted into the prompt box, newest first, drawn in the pane. */
       fromYou: HcpMedia[]
+      grants: HcpGrant[]
+      outward: HcpOutward[]
+      approvals: HcpApproval[]
     }
   }
 }

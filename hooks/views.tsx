@@ -5,9 +5,9 @@
 
 import type { ElementTable, RenderSurface } from 'claude-code'
 
-import type { HcpCard, HcpDelivery, HcpMedia, HcpMode, HcpScheduled } from '../types'
+import type { HcpCard, HcpDelivery, HcpGrant, HcpMedia, HcpMode, HcpOutward, HcpScheduled } from '../types'
 import { STEERS, clip, labels, services } from './model'
-import type { Steer } from './model'
+import type { ReachChoice, Steer } from './model'
 
 export type Actions = {
   pick: (id: string, value: string) => void
@@ -39,6 +39,9 @@ export type Actions = {
   clearFromYou: () => void
   /** j/k: the next or previous open card takes the hotkeys and the focus. */
   move: (step: number) => void
+  /** The person's answer to a held call. */
+  reach: (id: string, choice: ReachChoice, note?: string) => void
+  revokeGrant: (id: string) => void
 }
 
 export type Snapshot = {
@@ -55,6 +58,11 @@ export type Snapshot = {
   active: string | undefined
   outbox: HcpMedia[]
   fromYou: HcpMedia[]
+  /** Grants still live. */
+  grants: HcpGrant[]
+  /** Calls that left the machine or were held this session, newest first. */
+  outward: HcpOutward[]
+  now: number
 } & Pictures
 
 /** How pictures draw: the terminal's Image reads files, other surfaces' Svg carries bytes. */
@@ -78,6 +86,7 @@ export const THEME = {
   ask: '#38BDF8',
   handoff: '#FB7185',
   share: '#34D399',
+  reach: '#F97316',
   on: '#22C55E',
   ink: '#0B1220',
 } as const
@@ -272,15 +281,104 @@ function queuedRow(els: ElementTable, card: HcpCard) {
   )
 }
 
+const LEVEL_LABEL = { local: 'local', own: 'your account', shared: 'others can see', notifies: 'notifies people' } as const
+
+const minutesLeft = (until: number, now: number) => {
+  const m = Math.max(0, Math.round((until - now) / 60_000))
+
+  return m >= 90 ? `${Math.round(m / 60)}h left` : `${m}m left`
+}
+
+/** One line under a tool row, or in the pane's ledger: where the call went and on whose say-so. */
+export function reachBadge(els: ElementTable, row: HcpOutward, now: number) {
+  const { Text } = els
+  const level = row.level ? LEVEL_LABEL[row.level] : 'reach unknown'
+  const to = row.audience.length > 0 ? ` → ${clip(row.audience.join(', '), 60)}` : ''
+  const how =
+    row.verdict === 'hold'
+      ? `held · card ${row.cardId}`
+      : row.verdict === 'approved'
+        ? `sent from card ${row.cardId}`
+        : row.verdict === 'grant'
+          ? `allowed by grant ${row.grantId}`
+          : level
+  const color = row.level === 'notifies' ? THEME.reach : undefined
+  const ago = Math.round((now - row.at) / 60_000)
+
+  return (
+    <Text dimColor={color === undefined}>
+      <Text color={color}>{row.verdict === 'hold' ? '⏸' : '↗'}</Text> {row.channel}
+      {to} · {how}
+      {row.verdict === 'hold' || row.verdict === 'badge' ? '' : ` · ${level}`}
+      {ago > 0 ? ` · ${ago}m ago` : ''}
+    </Text>
+  )
+}
+
+/** A held call: the exact content, who it reaches, and how to answer. */
+function reachCard(els: ElementTable, card: HcpCard, act: Actions, ctx: CardContext) {
+  const { Box, Text, Button, Markdown } = els
+  const Input = 'Input' in els ? els.Input : undefined
+  const r = card.reach!
+  const id = card.id
+  const color = THEME.reach
+  const key = (hotkey: string) => (ctx.hasKeys ? { hotkey } : {})
+  const fence = r.content.includes('```') ? '~~~' : '```'
+
+  return (
+    <Box key={`card-${id}`} flexDirection="column" borderStyle="round" borderColor={color} paddingX={1}>
+      <Box flexDirection="row" justifyContent="space-between">
+        <Text>
+          {ctx.hasKeys && <Text color={color}>▸ </Text>}
+          {badge(els, id, color)}{' '}
+          <Text weight="bold" size="title">
+            ✉ {card.title}
+          </Text>
+        </Text>
+        <Button key={`${id}-x`} label="×" role="dismiss" plain dimColor {...key('x')} onPress={() => act.reach(id, 'not-now')} />
+      </Box>
+      <Text dimColor>
+        {LEVEL_LABEL[r.level]}
+        {r.audience.length > 0 ? ` · to ${clip(r.audience.join(', '), 120)}` : ''}
+      </Text>
+      {card.detail && <Text dimColor>Why: {card.detail}</Text>}
+      <Markdown text={`${fence}\n${r.content}\n${fence}`} />
+      <Box flexDirection="row" flexWrap="wrap" gap={1}>
+        <Button key={`${id}-send`} label="Send" variant="primary" {...key('s')} onPress={() => act.reach(id, 'send')}>
+          {big(els, '➤ Send', color)}
+        </Button>
+        <Button key={`${id}-similar-1h`} label="Send · allow similar 1h" onPress={() => act.reach(id, 'similar-1h')}>
+          {big(els, '➤ Send · allow similar 1h')}
+        </Button>
+        <Button key={`${id}-similar-day`} label="… for today" onPress={() => act.reach(id, 'similar-day')} />
+        <Button key={`${id}-draft`} label="Save as draft" onPress={() => act.reach(id, 'draft')} />
+        <Button key={`${id}-not-now`} label="Not now" dimColor onPress={() => act.reach(id, 'not-now')} />
+      </Box>
+      {Input && (
+        <Input
+          key={`${id}-note`}
+          placeholder="What to change before it goes, Enter sends"
+          submitLabel="send"
+          onInput={value => act.draft(id, value)}
+          onSubmit={value => act.reach(id, 'change', value)}
+        />
+      )}
+      {card.progress && <Text color={color}>{card.progress}</Text>}
+    </Box>
+  )
+}
+
 export function cardView(els: ElementTable, card: HcpCard, act: Actions, ctx: CardContext) {
   if (card.status === 'queued') return queuedRow(els, card)
   if (card.status !== 'open') return answeredRow(els, card)
+  if (card.kind === 'reach') return reachCard(els, card, act, ctx)
 
   const { Box, Text, Button, Markdown } = els
   const Input = 'Input' in els ? els.Input : undefined
   const id = card.id
   const color = THEME[card.kind]
   const service = card.service === undefined ? undefined : services()[card.service]
+
   const laterLabel = ctx.laterLabel
   const key = (hotkey: string) => (ctx.hasKeys ? { hotkey } : {})
   const later = (
@@ -538,6 +636,33 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
           ))}
         </Box>
       </Box>
+
+      {s.grants.length > 0 && (
+        <Box flexDirection="column">
+          {section('Active grants')}
+          {s.grants.map(g => (
+            <Box key={`grant-${g.id}`} flexDirection="row" gap={1} flexWrap="wrap">
+              <Text>
+                {badge(els, g.id, THEME.reach)} {g.channel}
+                {g.audience.length > 0 ? ` → ${clip(g.audience.join(', '), 50)}` : ''}{' '}
+                <Text dimColor>
+                  · {minutesLeft(g.expiresAt, s.now)} · used {g.uses}× · "{clip(g.intent, 80)}"
+                </Text>
+              </Text>
+              <Button key={`${g.id}-revoke`} label="Revoke" dimColor onPress={() => act.revokeGrant(g.id)} />
+            </Box>
+          ))}
+        </Box>
+      )}
+
+      {s.outward.length > 0 && (
+        <Box flexDirection="column">
+          {section('Outward this session')}
+          {s.outward.map(o => (
+            <Box key={`outward-${o.toolUseId}`}>{reachBadge(els, o, s.now)}</Box>
+          ))}
+        </Box>
+      )}
 
       {s.queue.length > 0 && (
         <Box flexDirection="column">

@@ -1,7 +1,10 @@
 // The plain logic of the hcp mod: what Claude is told, what an answer says,
 // which failures are an auth handoff, and when "later" is.
 
-import type { HcpCard, HcpDelivery, HcpMedia, HcpOption } from '../types'
+import type { HcpCard, HcpDelivery, HcpMedia, HcpMode, HcpOption } from '../types'
+import type { Judge } from './ports'
+import { parseTags } from './reach'
+import type { ReachTag } from './reach'
 
 const PROTOCOL_HEAD = `# Human Context Protocol (hcp mod)
 
@@ -12,6 +15,7 @@ const protocolRules = (watched: string) => [
   '- A decision among discrete options (approach, environment, scope, yes/no, approving a draft): call mcp__hcp__ask. Put a draft issue, comment or plan in `draft`. Don\'t restate the options after the call.',
   '- Text the person will paste elsewhere (a Slack message, an email, a PR description, a status update): call mcp__hcp__share instead of printing it for them to select. It is outward-facing: write it for its audience.',
   `- A step only they can do (an interactive login, VPN, an access request, /mcp auth, running something locally): call mcp__hcp__handoff. Auth failures from ${watched} in Bash, and MCP servers that need authorizing, are raised as handoffs for you, and you'll get a note saying so: don't retry the command, debug it, or run the login yourself.`,
+  '- Calls that reach other people (an email, a chat message, an issue or PR comment, an @mention) are held by hcp until the person approves the exact content on a card: the call fails with "[hcp] Held … card r<n>". Don\'t ask first and don\'t retry or work around a held call; carry on or end your turn. "[HCP r<n>] Send" means make the same call again, unchanged. Public pushes and shared docs only get a badge.',
   "- Cards don't block. Keep going on work that doesn't need the answer, or end your turn with one short line.",
   '- Pictures belong on the card: pass screenshots, renders or charts the person should look at in `media` (absolute paths, a one-line `caption` each; a video is sampled into frames) on any of the three tools, instead of describing them in prose.',
   '- A message ending in "Attached, view each with Read before acting:" carries the person\'s images or video frames: Read every listed path before you answer.',
@@ -174,11 +178,22 @@ export type Extension = {
   services: Record<string, Service>
   tools: Record<string, ToolTweak>
   labels: Partial<Labels>
+  /** Tool patterns and their reach level; a later file's win. */
+  reach: ReachTag[]
+  /** Who estimates a call's reach when the rules can't tell. */
+  judge: Judge
 }
 
-type Layered = { protocol: string[]; services: Record<string, Service>; tools: Record<string, ToolTweak>; labels: Labels }
+type Layered = {
+  protocol: string[]
+  services: Record<string, Service>
+  tools: Record<string, ToolTweak>
+  labels: Labels
+  reach: ReachTag[]
+  judge: Judge
+}
 
-const base = (): Layered => ({ protocol: [], services: { ...SERVICES }, tools: {}, labels: { ...LABELS } })
+const base = (): Layered => ({ protocol: [], services: { ...SERVICES }, tools: {}, labels: { ...LABELS }, reach: [], judge: 'jev' })
 
 let current = base()
 
@@ -187,6 +202,11 @@ export const services = () => current.services
 
 export const labels = () => current.labels
 
+/** The reach tags, a later file's first, so the first match is the one that wins. */
+export const reachTags = () => current.reach
+
+export const judge = () => current.judge
+
 /** Back to the base, then each extension in order: a later one wins a service or label. */
 export function applyExtensions(list: readonly Partial<Extension>[]) {
   const next = base()
@@ -194,6 +214,8 @@ export function applyExtensions(list: readonly Partial<Extension>[]) {
     next.protocol.push(...(ext.protocol ?? []))
     Object.assign(next.services, ext.services)
     Object.assign(next.labels, ext.labels)
+    next.reach.unshift(...(ext.reach ?? []))
+    if (ext.judge) next.judge = ext.judge
     for (const [name, tweak] of Object.entries(ext.tools ?? {})) {
       const was = next.tools[name] ?? {}
       next.tools[name] = {
@@ -264,6 +286,17 @@ export function parseExtension(json: string): { extension: Partial<Extension>; p
   if (raw.labels !== undefined && typeof raw.labels === 'object' && raw.labels !== null) {
     const l = raw.labels as Record<string, unknown>
     extension.labels = typeof l.copyRich === 'string' ? { copyRich: l.copyRich } : {}
+  }
+
+  if (raw.reach !== undefined) {
+    const parsed = parseTags(raw.reach)
+    extension.reach = parsed.tags
+    problems.push(...parsed.problems)
+  }
+
+  if (raw.judge !== undefined) {
+    if (raw.judge === 'jev' || raw.judge === 'haiku' || raw.judge === 'off') extension.judge = raw.judge
+    else problems.push('judge must be "jev", "haiku" or "off"')
   }
 
   return { extension, problems }
@@ -363,6 +396,45 @@ const serviceLabel = (service: string | undefined) =>
 
 export const autoHandoffNote = (card: HcpCard) =>
   `[HCP ${card.id}] ${serviceLabel(card.service)} needs the person to authenticate. A handoff card is up and the person has been notified. Don't retry the command, debug it, or run the login yourself: carry on with work that doesn't need it, or end your turn in one line. "[HCP ${card.id}] Done" arrives when it's fixed.`
+
+const LEVEL_WORDS = { local: 'stays local', own: 'goes to your own account', shared: 'is visible to others', notifies: 'notifies people' } as const
+
+/** What Claude reads when hcp holds a call: why, which card, and what to do meanwhile. */
+export function heldText(card: HcpCard, mode: HcpMode): string {
+  const r = card.reach!
+  const to = r.audience.length > 0 ? ` (${clip(r.audience.join(', '), 80)})` : ''
+  const meanwhile = mode === 'away' ? 'The person is away: it waits for them.' : 'The person has been shown the exact content.'
+
+  return `[hcp] Held: this ${r.channel} call ${LEVEL_WORDS[r.level]}${to}. Card ${card.id} is up. ${meanwhile} Don't retry it or reach them another way; carry on with work that doesn't need it, or end your turn in one line. "[HCP ${card.id}] Send" means make the same call again, unchanged.`
+}
+
+/** The person's choice on a reach card. */
+export type ReachChoice = 'send' | 'similar-1h' | 'similar-day' | 'change' | 'draft' | 'not-now'
+
+export const GRANT_HOURS: Partial<Record<ReachChoice, number>> = { 'similar-1h': 1, 'similar-day': 10 }
+
+/** What Claude reads for a reach card's answer. */
+export function reachAnswerText(card: HcpCard, choice: ReachChoice, note: string): string {
+  const r = card.reach!
+  const said = note.trim() ? ` Note: "${note.trim()}"` : ''
+  const hours = GRANT_HOURS[choice]
+  if (choice === 'send' || hours !== undefined) {
+    const grant =
+      hours === undefined
+        ? ''
+        : ` Similar ${r.channel} calls to the same audience may go through for the next ${hours === 1 ? 'hour' : `${hours} hours`} without a card.`
+
+    return `[HCP ${card.id}] Send it: make the held ${r.channel} call again, unchanged.${grant}${said}`
+  }
+  if (choice === 'change') {
+    return `[HCP ${card.id}] Don't send the ${r.channel} call as it is. Change it:${said || ' see the note.'} Then make the call again; hcp shows it to the person once more.`
+  }
+  if (choice === 'draft') {
+    return `[HCP ${card.id}] Don't send the ${r.channel} call. Save it as a draft instead (a draft in that service if it has one, else an mcp__hcp__share card with the text).${said}`
+  }
+
+  return `[HCP ${card.id} · NNTR] Not now: don't make the ${r.channel} call, and don't retry it.${said}`
+}
 
 export const postedText = (card: HcpCard) =>
   `Posted as card ${card.id}. Don't restate it in prose. The answer arrives as "[HCP ${card.id}] …" or "[HCP ${card.id} · NNTR] …".`

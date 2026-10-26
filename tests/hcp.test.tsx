@@ -1,6 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
+import { callKey, classifyCall, gateOf, parseTags, redact } from '../hooks/reach'
 import {
   detectService,
   markdownToHtml,
@@ -30,13 +31,14 @@ function engine(on: On, env: Record<string, string> = { HOME: '/nonexistent' }) 
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.panes', () => ({ value: [] }))
   on('ui.status', () => ({ value: undefined }))
+  on('ui.invalidate', () => ({ value: undefined }))
   on('ui.toast', (_, e) => {
     toasts.push(e.text)
 
     return { value: undefined }
   })
   on('ui.notify', () => ({ value: { isSent: false as const, reason: 'no-surface' as const } }))
-  mock.clock(on, { now: Date.UTC(2026, 9, 22, 16, 0) })
+  const clock = mock.clock(on, { now: Date.UTC(2026, 9, 22, 16, 0) })
   mock.env(on, env)
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('prompt.submit', (_, e) => {
@@ -45,7 +47,7 @@ function engine(on: On, env: Record<string, string> = { HOME: '/nonexistent' }) 
     return { text: e.text }
   })
 
-  return Object.assign(submitted, { registered, toasts })
+  return Object.assign(submitted, { registered, toasts, clock })
 }
 
 const PANE = {
@@ -131,6 +133,7 @@ test('a press mid-turn shows the card as queued at once and ignores repeat press
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.panes', () => ({ value: [] }))
   on('ui.status', () => ({ value: undefined }))
+  on('ui.invalidate', () => ({ value: undefined }))
   on('ui.toast', () => ({ value: undefined }))
   on('ui.notify', () => ({ value: { isSent: false as const, reason: 'no-surface' as const } }))
   mock.clock(on, { now: Date.UTC(2026, 9, 22, 16, 0) })
@@ -435,4 +438,236 @@ test('an extension file adds a watched login, protocol rules and wording', async
   expect(await ui.find({ type: 'Text', text: /Waiting on you \(2\)/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /Copy for Teams/ })).toBeDefined()
   await ui.unmount()
+})
+
+// --- the reach contract -------------------------------------------------------
+
+const COMMENT = "gh issue comment 12 -R dipseth/hcp --body 'Fixed in e53aa48, thanks @alice'"
+
+/** The engine's own tools beneath hcp: every call that gets through answers "ran", and is counted. */
+function tools(on: On) {
+  const ran: string[] = []
+  on('tool.call', (_, e) => {
+    ran.push(e.tool === 'Bash' ? String((e as unknown as { command: string }).command) : e.tool)
+
+    return { result: 'ran', text: 'ran' }
+  })
+
+  return ran
+}
+
+/** Jev over the host's fetch: answers each question asked from `p`, and records the bodies sent. */
+function jev(on: On, p: Record<string, number>, status = 200) {
+  const sent: { headers: Record<string, string>; body: string }[] = []
+  on('http.fetch', (_, e) => {
+    sent.push({ headers: { ...(e.init?.headers ?? {}) }, body: e.init?.body ?? '' })
+    const asked = Object.keys((JSON.parse(e.init?.body ?? '{}') as { questions?: Record<string, unknown> }).questions ?? {})
+    const answers = Object.fromEntries(asked.map(k => [k, { type: 'noul', noul: p[k] ?? 0 }]))
+
+    return { value: { status, ok: status < 400, headers: {}, text: status < 400 ? JSON.stringify({ answers, usage: { input_tokens: 400 } }) : 'boom' } }
+  })
+
+  return sent
+}
+
+/** The ledger's writes, by file. */
+function ledger(on: On) {
+  const files = new Map<string, string>()
+  on('fs.exists', (_, e) => ({ value: files.has(e.path) }))
+  on('fs.read', (_, e) => (files.has(e.path) ? { value: files.get(e.path)! } : { deny: `ENOENT: ${e.path}` }))
+  on('fs.write', (_, e) => {
+    files.set(e.path, e.text)
+
+    return { value: undefined }
+  })
+
+  return files
+}
+
+const KEYED = { HOME: '/home/me', HCP_TYPESAFE_API_KEY: 'apikey_SECRET123' }
+
+test('the rules sort calls by who they reach, and quoted text is not a command', () => {
+  const at = (tool: string, input: Record<string, unknown>) => classifyCall(tool, input)
+  expect(at('Read', { file_path: '/a' }).level).toBe('local')
+  expect(at('Bash', { command: 'git status && ls' }).level).toBe('local')
+  expect(at('Bash', { command: 'grep -rn "gh issue comment" .' }).level).toBe('local')
+  const comment = at('Bash', { command: COMMENT })
+  expect(comment.level).toBe('notifies')
+  expect(comment.channel).toBe('gh issue comment')
+  expect(comment.audience).toEqual(['dipseth/hcp#12'])
+  expect(at('Bash', { command: 'git push origin main' })).toMatchObject({ level: 'shared', audience: ['origin main'] })
+  expect(at('Bash', { command: 'curl -X POST https://api.example.com/v1 -d @x.json' })).toMatchObject({ source: 'none', audience: ['api.example.com'] })
+  expect(at('mcp__claude_ai_weReci__send_recipe_email', { to: 'sam@example.com', body: 'Try this' })).toMatchObject({
+    level: 'notifies',
+    audience: ['sam@example.com'],
+  })
+  expect(at('mcp__claude_ai_weReci__search_recipes', { query: 'soup' }).level).toBe('local')
+  expect(at('mcp__claude_ai_google-workspace__execute', { code: 'x' }).source).toBe('none')
+  expect(at('mcp__linear__create_issue', { title: 'Fix login', assignee: 'ana' })).toMatchObject({ level: 'notifies', why: 'sets assignee, which notifies them' })
+  expect(at('mcp__linear__create_issue', { title: 'Fix login' }).source).toBe('none')
+  expect(at('mcp__hcp__share', { title: 't', text: 'x' }).level).toBe('local')
+  expect(at('Artifact', { file_path: '/p.html' }).level).toBe('own')
+  expect(redact('token ghp_abcdef123 and Bearer xyz.abc')).toBe('token [redacted] and [redacted]')
+  expect(callKey('Bash', { command: 'a', tool_use_id: 't1' })).toBe(callKey('Bash', { tool_use_id: 't2', command: 'a' }))
+  const { tags, problems } = parseTags({ 'mcp__claude_ai_GroceryTrack__*': 'local', 'bash:^make deploy': 'shared', x: 'loud' })
+  expect(problems.length).toBe(1)
+  expect(classifyCall('Bash', { command: 'make deploy' }, tags).level).toBe('shared')
+})
+
+test('the gate holds a call that notifies people unless it fits a grant on every count', () => {
+  const t = { same_kind: 0.7, same_audience: 0.8, sensitive: 0.4 }
+  expect(gateOf('local', {}, false, t).branch).toBe('pass')
+  expect(gateOf('shared', {}, false, t).branch).toBe('badge')
+  expect(gateOf(undefined, {}, false, t).branch).toBe('badge')
+  expect(gateOf('notifies', {}, false, t).branch).toBe('hold')
+  const fits = { same_kind: [0.95], same_audience: [0.9], sensitive: [0.05] }
+  expect(gateOf('notifies', fits, true, t).branch).toBe('grant')
+  expect(gateOf('notifies', { ...fits, sensitive: [0.6] }, true, t).reason).toContain('new sensitive material')
+  expect(gateOf('notifies', { ...fits, same_kind: [0.4] }, true, t).branch).toBe('hold')
+  expect(gateOf('notifies', { ...fits, same_audience: [0.75] }, true, t).reason).toContain('a new audience')
+})
+
+test('a comment is held with its exact content on a card, and Send lets the same call through once', async ($, on) => {
+  const submitted = engine(on, KEYED)
+  const ran = tools(on)
+  const sent = jev(on, {})
+  ledger(on)
+  await $.session.start({ cwd: '/', surface: 'vscode', isInteractive: true })
+
+  const held = await $.tool.call({ tool: 'Bash', command: COMMENT })
+  expect(held.deny).toMatch(/^\[hcp\] Held: this gh issue comment call notifies people \(dipseth\/hcp#12\)\. Card r1 is up\./)
+  expect(ran).toEqual([])
+  expect(sent.length).toBe(0) // a rule knew: no judge asked
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'vscode' })
+  expect(await ui.find({ type: 'Text', text: /Send this gh issue comment\?/ })).toBeDefined()
+  expect(await ui.find({ type: 'Markdown', text: /Fixed in e53aa48, thanks @alice/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /held · card r1/ })).toBeDefined()
+  await ui.press({ key: 'r1-send' })
+  expect(submitted[submitted.length - 1]).toBe('[HCP r1] Send it: make the held gh issue comment call again, unchanged.')
+
+  expect((await $.tool.call({ tool: 'Bash', command: COMMENT })).deny).toBe(undefined)
+  expect(ran).toEqual([COMMENT])
+  // The approval was for one call: a third is held again.
+  expect((await $.tool.call({ tool: 'Bash', command: COMMENT })).deny).toMatch(/Card r2 is up/)
+  expect(await ui.find({ type: 'Text', text: /sent from card r1/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a change request goes back to Claude, and Not now is a note with no reply', async ($, on) => {
+  const submitted = engine(on, KEYED)
+  tools(on)
+  jev(on, {})
+  const session = mock.session(on)
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: COMMENT })
+  // Typed only where that server was connected when the types were laid.
+  await $.tool.call({ tool: 'mcp__claude_ai_weReci__send_recipe_email', to: 'sam@example.com', body: 'Try this soup' } as never)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+
+  await ui.input({ key: 'r1-note', text: 'drop the thanks' })
+  expect(submitted[submitted.length - 1]).toMatch(/^\[HCP r1\] Don't send the gh issue comment call as it is\. Change it: Note: "drop the thanks"/)
+  await ui.press({ key: 'r2-not-now' })
+  const notes = session.appended().map(row => JSON.stringify(row.message.content))
+  expect(notes.some(t => t.includes("[HCP r2 · NNTR] Not now: don't make the weReci send_recipe_email call"))).toBe(true)
+  expect(await ui.find({ type: 'Text', text: /Nothing waiting on you/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('an untagged write is judged by Jev, then haiku when Jev fails, and badged when nobody answers', async ($, on) => {
+  engine(on, KEYED)
+  const ran = tools(on)
+  const files = ledger(on)
+  let jevUp = true
+  const bodies: string[] = []
+  on('http.fetch', (_, e) => {
+    bodies.push(e.init?.body ?? '')
+    const answers = { notifies: { type: 'noul', noul: 0.9 }, visible: { type: 'noul', noul: 0.9 }, remote: { type: 'noul', noul: 1 } }
+
+    return { value: jevUp ? { status: 200, ok: true, headers: {}, text: JSON.stringify({ answers }) } : { status: 500, ok: false, headers: {}, text: 'down' } }
+  })
+  let haikuUp = true
+  on('model.complete', () => ({
+    value: haikuUp
+      ? { isAnswered: true as const, text: '{"notifies": 0.1, "visible": 0.2, "remote": 0.9}', usage: { input_tokens: 300, output_tokens: 20 } as never }
+      : { isAnswered: false as const, reason: 'empty-reply' as const, usage: {} as never },
+  }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const call = { tool: 'mcp__claude_ai_google-workspace__execute', code: 'gmail.send({to: "team@x.com"})' }
+  const run = (input: Record<string, unknown>) => $.tool.call(input as never)
+
+  expect((await run(call)).deny).toMatch(/Card r1 is up/)
+  expect(bodies[0]).toContain('jev-1.14.0')
+  expect(JSON.parse(bodies[0]!).state).toEqual({ call: { channel: 'google-workspace execute', audience: [], content: expect.stringContaining('gmail.send') } })
+
+  jevUp = false
+  expect((await run({ ...call, code: 'drive.list()' })).deny).toBe(undefined) // haiku: remote, nobody told
+  haikuUp = false
+  expect((await run({ ...call, code: 'drive.copy()' })).deny).toBe(undefined) // nobody: badge only
+  expect(ran.length).toBe(2)
+  const rows = [...files.values()].join('').trim().split('\n').map(line => JSON.parse(line) as Record<string, unknown>)
+  expect(rows.map(r => r.judgedBy)).toEqual(['jev', 'haiku', 'none'])
+  expect(rows.map(r => r.branch)).toEqual(['hold', 'pass', 'badge'])
+  expect(String(rows[2]!.problems)).toContain('jev: Jev HTTP 500')
+})
+
+test('Send and allow similar opens a grant that lets a like call through and holds a new audience', async ($, on) => {
+  const submitted = engine(on, KEYED)
+  const ran = tools(on)
+  const sent = jev(on, { same_kind: 0.94, same_audience: 0.92, sensitive: 0.04 })
+  ledger(on)
+  on('model.complete', () => ({
+    value: { isAnswered: true as const, text: 'a short status note on a GitHub issue', usage: { input_tokens: 10, output_tokens: 10 } as never },
+  }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: COMMENT })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'r1-similar-1h' })
+  expect(submitted[submitted.length - 1]).toContain('Similar gh issue comment calls to the same audience may go through for the next hour')
+  await settle()
+  expect(await ui.find({ type: 'Text', text: /a short status note on a GitHub issue/ })).toBeDefined()
+
+  await $.tool.call({ tool: 'Bash', command: COMMENT }) // the approved one
+  const like = "gh issue comment 12 -R dipseth/hcp --body 'Also shipped the docs'"
+  expect((await $.tool.call({ tool: 'Bash', command: like })).deny).toBe(undefined)
+  expect(ran).toEqual([COMMENT, like])
+  expect(JSON.parse(sent[0]!.body).state.grant.intent).toBe('a short status note on a GitHub issue')
+  expect(await ui.find({ type: 'Text', text: /allowed by grant g1/ })).toBeDefined()
+
+  // Another issue is another audience: no grant covers it.
+  expect((await $.tool.call({ tool: 'Bash', command: "gh issue comment 13 -R dipseth/hcp --body 'hi'" })).deny).toMatch(/Card r2/)
+  // An hour on, the grant is gone.
+  await submitted.clock.advance(61 * 60_000)
+  expect((await $.tool.call({ tool: 'Bash', command: like.replace('docs', 'site') })).deny).toMatch(/Card r3/)
+  await ui.unmount()
+})
+
+test('a tag in hcp.json holds a tool, and the key never reaches a card, a prompt or the ledger', async ($, on) => {
+  const submitted = engine(on, { HOME: '/home/me', HCP_EXTENSIONS: '~/team.json' })
+  tools(on)
+  const files = ledger(on)
+  files.set('/home/me/team.json', JSON.stringify({ reach: { 'mcp__claude_ai_GroceryTrack__*': 'notifies' } }))
+  files.set('/home/me/.claude/.env', 'OTHER=1\nHCP_TYPESAFE_API_KEY="apikey_SECRET123"\n')
+  const sent = jev(on, {})
+  on('prompt.compose', () => ({ sections: [] }))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+
+  expect((await $.tool.call({ tool: 'mcp__claude_ai_GroceryTrack__list_receipts' } as never)).deny).toMatch(/Card r1/)
+  const mystery = await $.tool.call({ tool: 'Bash', command: 'curl -X POST https://hooks.example.com -H "Authorization: Bearer apikey_SECRET123" -d x' })
+  expect(sent[0]?.headers.authorization).toBe('Bearer apikey_SECRET123') // read from ~/.claude/.env
+  expect(sent[0]?.body).not.toContain('SECRET123')
+  expect(mystery.deny).toBe(undefined)
+  const protocol = (
+    await $.prompt.compose({ model: 'm', promptModel: 'm', surfaces: ['terminal'], tools: [], outputStyle: null, traits: [] })
+  ).sections.find(s => s.id === 'hcp:protocol')?.text ?? ''
+  expect(protocol).toContain('held by hcp until the person approves')
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /SECRET123/ })).toBe(undefined)
+  expect(await ui.find({ type: 'Markdown', text: /SECRET123/ })).toBe(undefined)
+  await ui.unmount()
+  const written = [...files.entries()].filter(([path]) => path.includes('/ledger/')).map(([, text]) => text).join('')
+  expect(written.length).toBeGreaterThan(0)
+  expect(written).not.toContain('SECRET123')
+  expect(submitted.join('')).not.toContain('SECRET123')
 })

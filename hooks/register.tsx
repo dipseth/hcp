@@ -6,8 +6,14 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderSurface } from 'claude-code'
 
-import type { HcpCard, HcpDelivery, HcpMedia, HcpMode, HcpScheduled } from '../types'
+import type { HcpApproval, HcpCard, HcpDelivery, HcpGrant, HcpMedia, HcpMode, HcpOutward, HcpScheduled } from '../types'
 import { existing, expandAll, pastedImages, prepare, saveBytes, thumbnails } from './media'
+import { appendLedger, generatePort, reachPorts } from './ports'
+import type { Judged } from './ports'
+import { callKey, classifyCall, reachPipeline } from './reach'
+import type { CallFacts, ReachVerdict } from './reach'
+import { runPipeline, submitFeedback } from './vendor/dp.js'
+import type { RunRecord } from './vendor/dp.js'
 import {
   ASK_TOOL,
   HANDOFF_TOOL,
@@ -23,7 +29,10 @@ import {
   clip,
   deferText,
   detectService,
+  GRANT_HOURS,
   formatLocal,
+  heldText,
+  judge,
   markdownToHtml,
   markdownToPlain,
   needsAuthServers,
@@ -34,13 +43,15 @@ import {
   parseWhen,
   postedText,
   protocolText,
+  reachAnswerText,
+  reachTags,
   services,
   smartLater,
   splitPaths,
   withTweak,
 } from './model'
-import type { Extension, Steer, When } from './model'
-import { cardView, inbox } from './views'
+import type { Extension, ReachChoice, Steer, When } from './model'
+import { cardView, inbox, reachBadge } from './views'
 import type { Actions, Snapshot } from './views'
 
 type Engine = EngineInterface
@@ -57,6 +68,9 @@ const quickSent = atom({ plugin: 'hcp', key: 'quickSent' } as const, 0)
 const active = atom({ plugin: 'hcp', key: 'active' } as const, '')
 const outbox = atom({ plugin: 'hcp', key: 'outbox' } as const, [] as HcpMedia[])
 const fromYou = atom({ plugin: 'hcp', key: 'fromYou' } as const, [] as HcpMedia[])
+const grants = atom({ plugin: 'hcp', key: 'grants' } as const, [] as HcpGrant[])
+const outward = atom({ plugin: 'hcp', key: 'outward' } as const, [] as HcpOutward[])
+const approvals = atom({ plugin: 'hcp', key: 'approvals' } as const, [] as HcpApproval[])
 
 // UTC offset in minutes, from `date +%z`; the hooks environment's own zone may differ.
 let offset = -new Date().getTimezoneOffset()
@@ -68,6 +82,10 @@ const slideDrafts = new Map<string, string>()
 let quickDraftText = ''
 // Bash calls that raised a handoff: their result rows draw the card.
 const handoffCalls = new Set<string>()
+// Calls hcp held: their result rows draw the reach card.
+const heldCalls = new Set<string>()
+// Calls the person approved on a card, or a grant covers: tool.check lets them run without a second prompt.
+const passes = new Map<string, string>()
 // Cards whose press is being handled: a second press before the state lands does nothing.
 const busy = new Set<string>()
 // Whether a main-conversation turn is running: a prompt submitted now queues behind it.
@@ -156,7 +174,7 @@ async function postCard($: Engine, fields: Omit<HcpCard, 'id' | 'status' | 'note
   })
   const card: HcpCard = {
     ...fields,
-    id: `${fields.kind === 'handoff' ? 'h' : 'c'}${n}`,
+    id: `${fields.kind === 'handoff' ? 'h' : fields.kind === 'reach' ? 'r' : 'c'}${n}`,
     status: 'open',
     note: '',
     createdAt: await $.clock.now(),
@@ -346,6 +364,8 @@ async function openCards($: Engine) {
 function focusKey(card: HcpCard) {
   if (card.kind === 'ask') return card.options[0] ? `${card.id}-opt-${card.options[0].value}` : `${card.id}-send`
 
+  if (card.kind === 'reach') return `${card.id}-send`
+
   return card.kind === 'share' ? `${card.id}-copy-rich` : `${card.id}-done`
 }
 
@@ -414,6 +434,202 @@ async function verifyThenAnswer($: Engine, id: string) {
     await answerCard($, id, 'now', undefined, ` (Verified: \`${service.verify.join(' ')}\` passed.)`)
   } catch {
     await answerCard($, id, 'now', undefined, " (The mod couldn't run the check itself.)")
+  }
+}
+
+const APPROVAL_MS = 30 * 60_000
+
+async function noteOutward($: Engine, row: HcpOutward) {
+  await update($, outward, list => [...list.filter(o => o.toolUseId !== row.toolUseId), row].slice(-50))
+}
+
+/** The exact call's one-time approval, taken: it runs once. */
+async function takeApproval($: Engine, key: string): Promise<HcpApproval | undefined> {
+  const at = await $.clock.now()
+  let taken: HcpApproval | undefined
+  await update($, approvals, list =>
+    list.filter(a => {
+      if (a.expiresAt <= at) return false
+      if (taken === undefined && a.callKey === key) {
+        taken = a
+
+        return false
+      }
+
+      return true
+    }),
+  )
+
+  return taken
+}
+
+/** The newest live grant on the call's channel whose audience holds everyone the call names. */
+async function grantFor($: Engine, facts: CallFacts): Promise<HcpGrant | undefined> {
+  const at = await $.clock.now()
+
+  return (await read($, grants))
+    .filter(g => g.expiresAt > at && g.channel === facts.channel && facts.audience.every(who => g.audience.includes(who)))
+    .sort((a, b) => b.createdAt - a.createdAt)[0]
+}
+
+/**
+ * Before every tool call: the rules' view, then (for anything that may leave
+ * the machine) the reach pipeline. A call that notifies people runs only when
+ * the person approved it on a card or a grant covers it; otherwise it is held.
+ */
+async function guard($: Engine, e: { tool: string; tool_use_id: string; agentId?: string }, run: () => Promise<unknown>) {
+  const input = e as unknown as Record<string, unknown>
+  const facts = classifyCall(e.tool, input, reachTags())
+  if (facts.level === 'local' || facts.level === 'own') return run()
+  const at = await $.clock.now()
+  const key = callKey(e.tool, input)
+  const row = { toolUseId: e.tool_use_id, at, tool: e.tool, channel: facts.channel, audience: facts.audience }
+
+  const approval = await takeApproval($, key)
+  if (approval !== undefined) {
+    passes.set(e.tool_use_id, `approved on hcp card ${approval.cardId}`)
+    await noteOutward($, { ...row, level: facts.level ?? 'notifies', verdict: 'approved', why: `sent from card ${approval.cardId}`, cardId: approval.cardId })
+    void appendLedger($, { type: 'approved', tool: e.tool, channel: facts.channel, cardId: approval.cardId })
+    try {
+      return await run()
+    } finally {
+      passes.delete(e.tool_use_id)
+    }
+  }
+
+  const grant = await grantFor($, facts)
+  const judged: Judged = { by: 'rules', problems: [] }
+  let record: RunRecord | undefined
+  const ran = await runPipeline(
+    reachPipeline,
+    { facts, ...(grant ? { grant: { channel: grant.channel, audience: grant.audience, intent: grant.intent, example: grant.example } } : {}) },
+    reachPorts($, judge(), judged, r => void (record = r)),
+  )
+  const verdict = ran.output as ReachVerdict
+  void appendLedger($, {
+    type: 'run',
+    tool: e.tool,
+    channel: facts.channel,
+    audience: facts.audience,
+    level: verdict.level,
+    branch: verdict.branch,
+    judgedBy: judged.by,
+    ...(judged.problems.length > 0 ? { problems: judged.problems } : {}),
+    record,
+  })
+  const noted = { ...row, ...(verdict.level ? { level: verdict.level } : {}), why: verdict.reason, judgedBy: judged.by }
+
+  if (verdict.branch === 'pass') return run()
+  if (verdict.branch === 'badge') {
+    await noteOutward($, { ...noted, verdict: 'badge' })
+
+    return run()
+  }
+  if (verdict.branch === 'grant' && grant) {
+    await update($, grants, list => list.map(g => (g.id === grant.id ? { ...g, uses: g.uses + 1 } : g)))
+    await noteOutward($, { ...noted, verdict: 'grant', grantId: grant.id })
+    passes.set(e.tool_use_id, `covered by an hcp grant from card ${grant.cardId}`)
+    try {
+      return await run()
+    } finally {
+      passes.delete(e.tool_use_id)
+    }
+  }
+
+  const card = await postCard($, {
+    ...blank,
+    kind: 'reach',
+    toolUseId: e.tool_use_id,
+    ...(e.agentId !== undefined ? { agentId: e.agentId } : {}),
+    title: `Send this ${facts.channel}?`,
+    detail: verdict.reason,
+    reach: {
+      tool: e.tool,
+      channel: facts.channel,
+      audience: facts.audience,
+      level: verdict.level ?? 'notifies',
+      why: verdict.reason,
+      content: facts.content,
+      callKey: key,
+      ...(ran.runId ? { runId: ran.runId } : {}),
+      ...(grant ? { nearGrant: grant.id } : {}),
+    },
+  })
+  heldCalls.add(e.tool_use_id)
+  await noteOutward($, { ...noted, verdict: 'hold', cardId: card.id })
+  $.ui.toast(`Held for you: ${facts.channel}. Card ${card.id} has the exact content.`, { timeoutMs: 8000 })
+  void $.ui.notify(`Claude wants to send: ${facts.channel}`, { title: 'Approve on the HCP card' })
+
+  return { deny: heldText(card, await read($, mode)) }
+}
+
+/** Send, allow similar, change, save as draft, or not now: the person's answer to a held call. */
+async function answerReach($: Engine, id: string, choice: ReachChoice, typed?: string) {
+  if (busy.has(id)) return
+  busy.add(id)
+  try {
+    const card = await findCard($, id)
+    const r = card?.reach
+    if (!card || !r || card.status !== 'open') return
+    const note = (typed ?? drafts.get(id) ?? '').trim()
+    if (choice === 'change' && !note) {
+      $.ui.toast('Type the change first, then press Enter.')
+
+      return
+    }
+    const at = await $.clock.now()
+    const hours = GRANT_HOURS[choice]
+    if (choice === 'send' || hours !== undefined) {
+      await update($, approvals, list => [...list.filter(a => a.expiresAt > at), { callKey: r.callKey, cardId: id, expiresAt: at + APPROVAL_MS }])
+    }
+    if (hours !== undefined) {
+      const grant: HcpGrant = {
+        id: `g${id.slice(1)}`,
+        channel: r.channel,
+        audience: r.audience,
+        intent: clip(r.content.replace(/\s+/g, ' '), 120),
+        example: r.content,
+        cardId: id,
+        createdAt: at,
+        expiresAt: at + hours * 3_600_000,
+        uses: 0,
+      }
+      await update($, grants, list => [...list.filter(g => g.expiresAt > at), grant])
+      void describeIntent($, grant)
+    }
+    if (r.runId) {
+      // The feedback edge on the gate: was holding this call worth a card?
+      void submitFeedback(
+        reachPipeline,
+        { runId: r.runId, edgeId: 'reach-card', value: choice === 'send' || hours !== undefined ? 0 : 1, label: choice, sourceId: 'person' },
+        { scores: score => appendLedger($, { type: 'score', cardId: id, channel: r.channel, ...score }) },
+      ).catch(() => undefined)
+    }
+    const text = reachAnswerText(card, choice, note)
+    drafts.delete(id)
+    const delivery = choice === 'not-now' ? 'nntr' : 'now'
+    if (delivery === 'now') {
+      const wasQueued = isTurnRunning
+      await patchCard($, id, c => ({ ...c, note, status: 'queued', delivery, answer: text, progress: undefined }))
+      await refreshStatus($)
+      $.ui.toast(sentToast(wasQueued))
+    }
+    await deliver($, text, delivery, card.agentId)
+    await patchCard($, id, c => ({ ...c, note, status: 'answered', delivery, answer: text, progress: undefined }))
+    await refreshStatus($)
+  } finally {
+    busy.delete(id)
+  }
+}
+
+/** A grant's one-line intent, written by the generate port; the content's start stands until then. */
+async function describeIntent($: Engine, grant: HcpGrant) {
+  try {
+    const written = await generatePort($)({ nodeId: 'grant', prompt: 'grant-intent', route: 'grant-intent', input: { channel: grant.channel, content: grant.example } })
+    const text = (written.value as { text?: string }).text?.split('\n')[0]?.trim()
+    if (text) await update($, grants, list => list.map(g => (g.id === grant.id ? { ...g, intent: clip(text, 160) } : g)))
+  } catch {
+    // The clipped content stays the intent.
   }
 }
 
@@ -556,6 +772,9 @@ function actionsFor($: Engine): Actions {
         await update($, queue, list => list.filter(q => q.id !== id))
       })(),
     clearHistory: () => void update($, cards, list => list.filter(c => c.status === 'open')),
+    reach: (id, choice, note) => void answerReach($, id, choice, note),
+    revokeGrant: id =>
+      void update($, grants, list => list.filter(g => g.id !== id)).then(() => $.ui.toast('Grant revoked: similar calls get a card again.')),
     slide: (id, step) =>
       void patchCard($, id, c => {
         const count = c.media?.length ?? 0
@@ -622,6 +841,7 @@ async function snapshot($: Engine, surface: RenderSurface): Promise<Snapshot> {
   const current = await read($, active)
   const attached = await read($, outbox)
   const pasted = await read($, fromYou)
+  const live = (await read($, grants)).filter(g => g.expiresAt > at)
   const shown = [...open.flatMap(c => c.media ?? []), ...attached, ...pasted]
 
   return {
@@ -638,6 +858,9 @@ async function snapshot($: Engine, surface: RenderSurface): Promise<Snapshot> {
     fromYou: pasted,
     surface,
     thumbs: await thumbsFor($, surface, shown),
+    grants: live,
+    outward: (await read($, outward)).filter(o => o.verdict !== 'pass').slice(-8).reverse(),
+    now: at,
   }
 }
 
@@ -668,6 +891,7 @@ async function loadExtensions($: Engine) {
     problems.push(...parsed.problems.map(p => `${path}: ${p}`))
   }
   applyExtensions(loaded)
+  $.ui.invalidate('tool.describe')
   if (problems.length > 0) $.ui.toast(`hcp extension: ${problems.join('; ')}`, { timeoutMs: 15_000 })
 }
 
@@ -705,6 +929,7 @@ export const register: Register = on => {
 
     for (const card of await read($, cards)) {
       if (card.kind === 'handoff' && card.toolUseId) handoffCalls.add(card.toolUseId)
+      if (card.kind === 'reach' && card.toolUseId) heldCalls.add(card.toolUseId)
     }
     for (const item of await read($, queue)) await arm($, item)
     await refreshStatus($)
@@ -728,6 +953,42 @@ export const register: Register = on => {
     const composed = await next(e)
 
     return { sections: [...composed.sections, { id: 'hcp:protocol', text: protocolText(), scope: 'session' as const }] }
+  })
+
+  // Every call: anything that may reach people goes through the reach contract first.
+  on('tool.call', async ($, e, next) => {
+    if (e.tool.startsWith(TOOL_PREFIX)) return next(e)
+
+    return (await guard($, e, () => next(e))) as Awaited<ReturnType<typeof next>>
+  }).catch(($, e, next) => {
+    if (next.called) return next(e)
+    // The guard failed before the call ran: one that notifies people stays held.
+    const facts = classifyCall(e.tool, e as unknown as Record<string, unknown>, reachTags())
+
+    return facts.level === 'notifies'
+      ? { deny: `[hcp] Held: hcp couldn't check this ${facts.channel} call. Ask the person with mcp__hcp__ask (the text in \`draft\`) before trying again.` }
+      : next(e)
+  })
+
+  // A call the person approved on a card, or a grant covers, needs no second prompt. A deny stays a deny.
+  on('tool.check', async ($, e, next) => {
+    const verdict = await next(e)
+    const why = e.tool_use_id === undefined ? undefined : passes.get(e.tool_use_id)
+
+    return why !== undefined && verdict.decision === 'ask' ? { ...verdict, decision: 'allow' as const, reason: why } : verdict
+  })
+
+  // Claude reads the contract before it calls: tools that notify people say so.
+  on('tool.describe', async ($, e, next) => {
+    const described = await next(e)
+    if (e.tool === 'Bash') {
+      return { ...described, description: `${described.description}\n\nhcp holds commands that notify people (gh issue/pr comments, mail, chat webhooks) until the person approves the exact content on a card.` }
+    }
+    if (!e.tool.startsWith('mcp__') || e.tool.startsWith(TOOL_PREFIX)) return described
+    const facts = classifyCall(e.tool, {}, reachTags())
+    if (facts.level !== 'notifies') return described
+
+    return { ...described, description: `${described.description} (hcp: this notifies people, so a call is held for the person's OK on a card unless a grant covers it. Make the call; don't ask first.)` }
   })
 
   on('tool.call', { tool: 'mcp__hcp__ask' }, async ($, e) => {
@@ -892,7 +1153,20 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'ToolUse' }, async ($, e, next) => {
-    if (!e.props.tool.startsWith(TOOL_PREFIX) || e.props.isExpanded) return next(e)
+    if (e.props.isExpanded) return next(e)
+    if (!e.props.tool.startsWith(TOOL_PREFIX)) {
+      const row = (await read($, outward)).find(o => o.toolUseId === e.props.tool_use_id)
+      if (!row || row.verdict === 'pass') return next(e)
+      const els = $.ui.resolve(e)
+      const { Box } = els
+
+      return (
+        <Box flexDirection="column">
+          {await next(e)}
+          {reachBadge(els, row, await $.clock.now())}
+        </Box>
+      )
+    }
     const card = (await read($, cards)).find(c => c.toolUseId === e.props.tool_use_id)
     if (!card) return next(e)
     return cardView($.ui.resolve(e), card, actionsFor($), {
@@ -909,7 +1183,7 @@ export const register: Register = on => {
 
       return <Box />
     }
-    if (!handoffCalls.has(e.props.tool_use_id)) return next(e)
+    if (!handoffCalls.has(e.props.tool_use_id) && !heldCalls.has(e.props.tool_use_id)) return next(e)
     const card = (await read($, cards)).find(c => c.toolUseId === e.props.tool_use_id)
     if (!card) return next(e)
     const els = $.ui.resolve(e)
