@@ -16,6 +16,8 @@ const protocolRules = (watched: string) => [
   '- Text the person will paste elsewhere (a Slack message, an email, a PR description, a status update): call mcp__hcp__share instead of printing it for them to select. It is outward-facing: write it for its audience.',
   `- A step only they can do (an interactive login, VPN, an access request, /mcp auth, running something locally): call mcp__hcp__handoff. Auth failures from ${watched} in Bash, and MCP servers that need authorizing, are raised as handoffs for you, and you'll get a note saying so: don't retry the command, debug it, or run the login yourself.`,
   '- Calls that reach other people (an email, a chat message, an issue or PR comment, an @mention) are held by hcp until the person approves the exact content on a card: the call fails with "[hcp] Held … card r<n>". Don\'t ask first and don\'t retry or work around a held call; carry on or end your turn. "[HCP r<n>] Send" means make the same call again, unchanged. Public pushes and shared docs only get a badge.',
+  '- When you make a non-trivial choice yourself (an approach, a library, a scope cut, a default that matters), record it with mcp__hcp__decided in one call and carry on. Give every mcp__hcp__ask a `kind` too. hcp learns from how the person answers like decisions, and shows yours in the pane where they can disagree.',
+  '- To give a decision in the task a decision pipeline (a model estimates, code decides, the person corrects it later), or to propose a better way for hcp to choose what to ask, use mcp__hcp__pipeline: `describe` first, then `define`, then `run`.',
   "- Cards don't block. Keep going on work that doesn't need the answer, or end your turn with one short line.",
   '- Pictures belong on the card: pass screenshots, renders or charts the person should look at in `media` (absolute paths, a one-line `caption` each; a video is sampled into frames) on any of the three tools, instead of describing them in prose.',
   '- A message ending in "Attached, view each with Read before acting:" carries the person\'s images or video frames: Read every listed path before you answer.',
@@ -91,6 +93,10 @@ export const ASK_TOOL = {
         },
       },
       multi: { type: 'boolean', description: 'Allow several picks.' },
+      kind: {
+        type: 'string',
+        description: 'A short slug for the sort of choice (env-choice, library, scope, naming): hcp compares it with like decisions the person answered before.',
+      },
       recommended: {
         type: 'array',
         items: { type: 'string' },
@@ -135,6 +141,45 @@ export const SHARE_TOOL = {
     required: ['title', 'text'],
   } satisfies Schema,
   isDeferred: false,
+} as const
+
+export const DECIDED_TOOL = {
+  name: 'decided',
+  description:
+    'Record a choice you made yourself without asking (an approach, a library, a scope cut, a default), in one call, then carry on. The person sees it in the HCP pane and can agree or disagree; their answers teach hcp which choices to ask about next time. Returns at once.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      title: { type: 'string', description: 'The choice, as a question: "Which date library?"' },
+      choice: { type: 'string', description: 'What you chose.' },
+      alternatives: { type: 'array', items: { type: 'string' }, description: 'What else you considered.' },
+      why: { type: 'string', description: 'One line.' },
+      kind: { type: 'string', description: 'A short slug for the sort of choice: library, scope, naming, approach.' },
+      reversible: { type: 'boolean', description: 'Whether it is cheap to undo later.' },
+    },
+    required: ['title', 'choice', 'kind'],
+  } satisfies Schema,
+  isDeferred: false,
+} as const
+
+export const PIPELINE_TOOL = {
+  name: 'pipeline',
+  description:
+    'Decision pipelines you write as JSON specs: a model estimates (Jev yes/no questions), code decides (a gate with thresholds), the person corrects it later (a feedback edge). `describe` returns the contract, the registry and an example; `define` compiles a spec and saves it, or returns every problem to fix; `run` runs a saved one on an input; `list` lists them. scope "external" is for a decision in the task; scope "internal" proposes a challenger to how hcp chooses what to ask, which only runs in shadow.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      action: { type: 'string', enum: ['describe', 'define', 'run', 'list'] },
+      scope: { type: 'string', enum: ['internal', 'external'] },
+      spec: { type: 'object', description: 'define: the pipeline spec.' },
+      questions: { type: 'object', description: 'define: question sets by name: { "<set>": { "<key>": { "type": "noul", "instructions": "..." } } }.' },
+      routes: { type: 'object', description: 'define: routes by name for generate nodes: { "<route>": { "model": "haiku", "version": "1", "system": "...", "maxTokens": 300 } }.' },
+      name: { type: 'string', description: 'run: the saved pipeline id.' },
+      input: { type: 'object', description: 'run: the pipeline input.' },
+    },
+    required: ['action'],
+  } satisfies Schema,
+  isDeferred: true,
 } as const
 
 export type Service = {

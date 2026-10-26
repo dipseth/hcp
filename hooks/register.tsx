@@ -6,9 +6,10 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderSurface } from 'claude-code'
 
-import type { HcpApproval, HcpCard, HcpDelivery, HcpGrant, HcpMedia, HcpMode, HcpOutward, HcpScheduled } from '../types'
+import type { HcpApproval, HcpCard, HcpDecision, HcpDelivery, HcpGrant, HcpMedia, HcpMode, HcpOutward, HcpScheduled } from '../types'
+import { bindSession, loadHistory, pipelineTool, resolved, shadow, shadowReport } from './decide'
 import { existing, expandAll, pastedImages, prepare, saveBytes, thumbnails } from './media'
-import { appendLedger, generatePort, reachPorts } from './ports'
+import { appendLedger, generatePort, initObservability, reachPorts, scoresPort } from './ports'
 import type { Judged } from './ports'
 import { callKey, classifyCall, reachPipeline } from './reach'
 import type { CallFacts, ReachVerdict } from './reach'
@@ -16,7 +17,9 @@ import { runPipeline, submitFeedback } from './vendor/dp.js'
 import type { RunRecord } from './vendor/dp.js'
 import {
   ASK_TOOL,
+  DECIDED_TOOL,
   HANDOFF_TOOL,
+  PIPELINE_TOOL,
   MAX_MEDIA,
   SHARE_TOOL,
   STEERS,
@@ -71,6 +74,50 @@ const fromYou = atom({ plugin: 'hcp', key: 'fromYou' } as const, [] as HcpMedia[
 const grants = atom({ plugin: 'hcp', key: 'grants' } as const, [] as HcpGrant[])
 const outward = atom({ plugin: 'hcp', key: 'outward' } as const, [] as HcpOutward[])
 const approvals = atom({ plugin: 'hcp', key: 'approvals' } as const, [] as HcpApproval[])
+const decisions = atom({ plugin: 'hcp', key: 'decisions' } as const, [] as HcpDecision[])
+
+// This session's decisions, mirrored so the surface pipeline's precedents read them without a $ call.
+let liveDecisions: HcpDecision[] = []
+// Shadow runs still going, by decision: a resolution waits for its run, so the feedback lands.
+const shadowing = new Map<string, Promise<void>>()
+let sessionId = 'session'
+let repo: string | undefined
+
+async function saveDecisions($: Engine, fn: (list: HcpDecision[]) => HcpDecision[]) {
+  await update($, decisions, list => (liveDecisions = fn(list).slice(-200)))
+}
+
+/** A new decision: kept, and run past the surface pipelines in the background. */
+async function recordDecision($: Engine, fields: Omit<HcpDecision, 'session' | 'at' | 'outcome' | 'repo'>) {
+  const decision: HcpDecision = { ...fields, session: sessionId, at: await $.clock.now(), outcome: 'pending', ...(repo ? { repo } : {}) }
+  await saveDecisions($, list => [...list.filter(d => d.id !== decision.id), decision])
+  const run = shadow($, decision, judge())
+    .then(verdicts => saveDecisions($, list => list.map(d => (d.id === decision.id ? { ...d, shadow: verdicts } : d))))
+    .catch(() => undefined)
+    .finally(() => shadowing.delete(decision.id))
+  shadowing.set(decision.id, run)
+
+  return decision
+}
+
+/** The person's answer settles a decision: kept in the ledger as a precedent, and fed back to each shadow run. */
+async function resolveDecision($: Engine, id: string, outcome: HcpDecision['outcome'], picked?: string) {
+  await shadowing.get(id)
+  let done: HcpDecision | undefined
+  await saveDecisions($, list =>
+    list.map(d => (d.id === id && d.outcome === 'pending' ? (done = { ...d, outcome, ...(picked ? { picked } : {}) }) : d)),
+  )
+  if (done) await resolved($, done)
+}
+
+/** How an ask card's answer reads as a decision outcome. */
+async function resolveAsk($: Engine, card: HcpCard) {
+  const decision = liveDecisions.find(d => d.id === card.id)
+  if (!decision) return
+  const labels = card.options.filter(o => card.picked.includes(o.value)).map(o => o.label)
+  const outcome = labels.length === 0 ? 'no-pick' : decision.choice !== undefined && labels.includes(decision.choice) ? 'took' : 'overrode'
+  await resolveDecision($, card.id, outcome, labels.join(', ') || undefined)
+}
 
 // UTC offset in minutes, from `date +%z`; the hooks environment's own zone may differ.
 let offset = -new Date().getTimezoneOffset()
@@ -327,6 +374,7 @@ async function answerCard($: Engine, id: string, delivery: HcpDelivery, note?: s
   }
   await patchCard($, id, c => ({ ...c, note: withNote.note, status: 'answered', delivery, answer: full, progress: undefined }))
   await refreshStatus($)
+  if (card.kind === 'ask') await resolveAsk($, card)
 }
 
 /** The slide notes kept with Enter, overlaid with ones typed and not yet kept. */
@@ -551,7 +599,8 @@ async function guard($: Engine, e: { tool: string; tool_use_id: string; agentId?
       why: verdict.reason,
       content: facts.content,
       callKey: key,
-      ...(ran.runId ? { runId: ran.runId } : {}),
+      // No tracer, no run id: the run key names the run for its feedback.
+      runId: ran.runId ?? ran.runKey,
       ...(grant ? { nearGrant: grant.id } : {}),
     },
   })
@@ -602,7 +651,7 @@ async function answerReach($: Engine, id: string, choice: ReachChoice, typed?: s
       void submitFeedback(
         reachPipeline,
         { runId: r.runId, edgeId: 'reach-card', value: choice === 'send' || hours !== undefined ? 0 : 1, label: choice, sourceId: 'person' },
-        { scores: score => appendLedger($, { type: 'score', cardId: id, channel: r.channel, ...score }) },
+        { scores: scoresPort($, { cardId: id, channel: r.channel }) },
       ).catch(() => undefined)
     }
     const text = reachAnswerText(card, choice, note)
@@ -645,7 +694,25 @@ function actionsFor($: Engine): Actions {
     draft: (id, text) => void drafts.set(id, text),
     answer: (id, delivery, note) => void answer($, id, delivery, note),
     dismiss: id =>
-      void patchCard($, id, c => ({ ...c, status: 'dismissed', progress: undefined })).then(() => refreshStatus($)),
+      void patchCard($, id, c => ({ ...c, status: 'dismissed', progress: undefined }))
+        .then(() => refreshStatus($))
+        .then(() => resolveDecision($, id, 'dismissed')),
+    agree: id =>
+      void resolveDecision($, id, 'agreed').then(() => $.ui.toast('Noted: choices like this need less asking.')),
+    disagree: id =>
+      void (async () => {
+        const decision = liveDecisions.find(d => d.id === id)
+        if (!decision || decision.outcome !== 'pending') return
+        const note = (drafts.get(id) ?? '').trim()
+        drafts.delete(id)
+        await resolveDecision($, id, 'disagreed')
+        $.ui.toast(sentToast(isTurnRunning))
+        await deliver(
+          $,
+          `[HCP ${id}] I disagree with "${decision.title}" (you chose ${decision.choice}).${note ? ` ${note}` : ''} Stop and check with me before building on it.`,
+          'now',
+        )
+      })(),
     fill: id =>
       void findCard($, id).then(async card => {
         if (!card?.fix) return
@@ -861,6 +928,8 @@ async function snapshot($: Engine, surface: RenderSurface): Promise<Snapshot> {
     grants: live,
     outward: (await read($, outward)).filter(o => o.verdict !== 'pass').slice(-8).reverse(),
     now: at,
+    // Read through the atom, so the pane redraws when a decision changes.
+    decided: (await read($, decisions)).filter(d => d.source === 'decided').slice(-5).reverse(),
   }
 }
 
@@ -904,15 +973,23 @@ export const register: Register = on => {
       // No process access (tests, a restricted host): keep the environment's own offset.
     }
     await loadExtensions($)
+    sessionId = await $.session.id().catch(() => 'session')
+    repo = e.cwd.replace(/\/+$/, '').split('/').pop() || undefined
+    liveDecisions = await read($, decisions)
+    bindSession(() => liveDecisions)
+    await loadHistory($)
+    await initObservability($)
 
     await Promise.all([
       $.tool.register(withTweak(ASK_TOOL)),
       $.tool.register(withTweak(HANDOFF_TOOL)),
       $.tool.register(withTweak(SHARE_TOOL)),
+      $.tool.register(withTweak(DECIDED_TOOL)),
+      $.tool.register(withTweak(PIPELINE_TOOL)),
       $.command.register({
         name: 'hcp',
         description: 'Open the HCP pane: cards waiting on you, quick replies, steers, mode',
-        argumentHint: '[pairing|heads-down|away|clear]',
+        argumentHint: '[pairing|heads-down|away|clear|shadow]',
       }),
       $.command.register({
         name: 'nntr',
@@ -1018,9 +1095,42 @@ export const register: Register = on => {
       picked: isMulti ? picked : picked.slice(0, 1),
       ...pictures.fields,
     })
+    const recommended = options.find(o => card.picked.includes(o.value))
+    await recordDecision($, {
+      id: card.id,
+      source: 'ask',
+      kind: typeof input.kind === 'string' && input.kind.trim() ? input.kind.trim() : 'general',
+      title: card.title,
+      ...(recommended ? { choice: recommended.label } : {}),
+      alternatives: options.map(o => o.label),
+    })
 
     return { result: postedText(card) + pictures.note }
   }).catch(() => ({ deny: 'hcp could not post the card; ask in prose this time.' }))
+
+  on('tool.call', { tool: /^mcp__hcp__decided$/ }, async ($, e) => {
+    const input = e as unknown as Record<string, unknown>
+    if (typeof input.title !== 'string' || typeof input.choice !== 'string' || typeof input.kind !== 'string') {
+      return { deny: 'decided needs `title`, `choice` and `kind`.' }
+    }
+    const n = liveDecisions.filter(d => d.source === 'decided').length + 1
+    const decision = await recordDecision($, {
+      id: `d${n}`,
+      source: 'decided',
+      kind: input.kind.trim() || 'general',
+      title: input.title,
+      choice: input.choice,
+      alternatives: Array.isArray(input.alternatives) ? input.alternatives.filter((a): a is string => typeof a === 'string') : [],
+      ...(typeof input.why === 'string' ? { why: input.why } : {}),
+      ...(typeof input.reversible === 'boolean' ? { reversible: input.reversible } : {}),
+    })
+
+    return { result: `Recorded ${decision.id}. Carry on; the person can disagree from the pane ("[HCP ${decision.id}] I disagree …").` }
+  }).catch(() => ({ result: 'hcp could not record it; carry on.' }))
+
+  on('tool.call', { tool: /^mcp__hcp__pipeline$/ }, async ($, e) => ({
+    result: await pipelineTool($, e as unknown as Record<string, unknown>, judge()),
+  })).catch(() => ({ deny: 'hcp could not run the pipeline action.' }))
 
   on('tool.call', { tool: 'mcp__hcp__handoff' }, async ($, e) => {
     const input = e as unknown as Record<string, unknown>
@@ -1110,6 +1220,7 @@ export const register: Register = on => {
 
       return { text: `HCP mode: ${arg}.` }
     }
+    if (arg === 'shadow') return { text: shadowReport(liveDecisions) }
     if (arg === 'clear') {
       await update($, cards, list => list.filter(c => c.status === 'open'))
 

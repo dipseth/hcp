@@ -131,6 +131,36 @@ export type HcpOutward = {
 /** Send on a reach card: this exact call may run once, until `expiresAt`. */
 export type HcpApproval = { callKey: string; cardId: string; expiresAt: number }
 
+/**
+ * A decision Claude made or asked about: the surface pipeline's input, and a
+ * precedent for the next one once the person's answer says how it went.
+ */
+export type HcpDecision = {
+  /** The ask card's id, or `d<n>` for one Claude recorded with mcp__hcp__decided. */
+  id: string
+  source: 'ask' | 'decided'
+  /** Claude's slug for the sort of choice: `env-choice`, `library`, `scope`. */
+  kind: string
+  title: string
+  /** Claude's pick: the recommended option on an ask, the choice made on a decided. */
+  choice?: string
+  alternatives: string[]
+  why?: string
+  reversible?: boolean
+  /** The working directory's last segment. */
+  repo?: string
+  session: string
+  at: number
+  /**
+   * `took`: the person kept Claude's pick; `overrode`: picked another; `no-pick`: answered with a note
+   * only; `agreed` / `disagreed`: on a recorded decision; `dismissed`, `pending`: nothing telling yet.
+   */
+  outcome: 'pending' | 'took' | 'overrode' | 'no-pick' | 'dismissed' | 'agreed' | 'disagreed'
+  picked?: string
+  /** What each surface pipeline would have done, by pipeline id: the champion and any challenger. */
+  shadow?: Record<string, { verdict: string; reason: string; runId?: string }>
+}
+
 export type HcpMode = 'pairing' | 'heads-down' | 'away'
 
 declare module 'claude-code' {
@@ -152,6 +182,8 @@ declare module 'claude-code' {
       grants: HcpGrant[]
       outward: HcpOutward[]
       approvals: HcpApproval[]
+      /** This session's decisions; earlier sessions' are read from the ledger. */
+      decisions: HcpDecision[]
     }
   }
 }

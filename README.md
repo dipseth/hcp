@@ -70,6 +70,34 @@ Calibration on `tests/fixtures/reach-calls.json` (jev-1.14.0, 2026-10-26):
 
 The sample is small, so treat the thresholds as a start and re-run `node build/calibrate.ts` as the fixtures grow.
 
+## Decisions as evidence
+
+Which choices should reach you at all? Today Claude decides that from prose. hcp is turning it into evidence, starting in shadow:
+
+- **Every decision gets a record.** An ask card, given a `kind` (`env-choice`, `library`), is one. So is a choice Claude makes itself and records with `mcp__hcp__decided`; the pane lists those under **Claude decided** with **👍 Fine** and **✋ Disagree**. Disagreeing sends Claude back to check with you.
+- **The surface pipeline** (`hooks/surface.ts`, a JSON spec) runs on each record. It reads the most similar past decisions, from this session and from the ledger's last 30 days. Jev answers which of them really are the same kind of choice, plus three facts about this one: reversible? affects others? are the options close? Code counts your record on the matching ones, giving this session double weight: (kept + 1) / (counted + 2). A gate then picks one of:
+  - **ask**: a card before Claude acts;
+  - **tell**: Claude acts, and you get a card to override;
+  - **log**: recorded only.
+- **New ideas get a way in.** With fewer than 3 precedents, the verdict is ask. A fixed 10% of decisions are asked anyway, chosen deterministically, so the record keeps learning. Anything that affects others or is hard to undo is always asked.
+- **It changes nothing yet.** The verdict is recorded beside what you actually did, and your answer scores it: was asking needed? `/hcp shadow` shows how often it would have been right, how many cards it would have saved, and how often it would have skipped asking when you wanted a say. It earns control only through a pre-registered trial.
+
+## Pipelines Claude writes
+
+`mcp__hcp__pipeline` lets Claude write decision pipelines as JSON specs against hcp's registry, using the same Jev, haiku, ledger and Langfuse ports:
+
+- `describe` returns the contract, the registry and the champion as an example.
+- `define` compiles a spec and saves it with an SVG diagram under `~/.claude/hcp/pipelines/<scope>/`. A spec with problems isn't saved; every problem comes back at once, for Claude to fix.
+- `run` runs a saved pipeline; `list` lists them.
+
+There are two scopes:
+- **external**: a decision in your task, such as "is this release risky?".
+- **internal**: a challenger to how hcp chooses what to ask. It runs in shadow beside the champion on every decision, and `/hcp shadow` compares the two.
+
+## Observability
+
+With `HCP_LANGFUSE_PUBLIC_KEY`, `HCP_LANGFUSE_SECRET_KEY` and `HCP_LANGFUSE_BASE_URL` set (in the environment or `~/.claude/.env`), every run, whether reach, surface or one Claude wrote, is a Langfuse trace with a span per node. Every card answer is a score on that trace (`hold_needed`, `surfaced_right`). Langfuse is best effort: the local ledger keeps everything regardless.
+
 ## Extending it for your environment
 
 The base knows one watched login (gcloud/bq) and generic wording. An environment adds its own in a JSON extension file, without forking the code. hcp reads `~/.claude/hcp.json` at session start, or the files named in `HCP_EXTENSIONS` (paths joined by `:`, layered in order, a later one winning). Each key is optional:

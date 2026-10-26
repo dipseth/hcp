@@ -2,6 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { callKey, classifyCall, gateOf, parseTags, redact } from '../hooks/reach'
+import { SURFACE_SPEC } from '../hooks/surface'
 import {
   detectService,
   markdownToHtml,
@@ -670,4 +671,206 @@ test('a tag in hcp.json holds a tool, and the key never reaches a card, a prompt
   expect(written.length).toBeGreaterThan(0)
   expect(written).not.toContain('SECRET123')
   expect(submitted.join('')).not.toContain('SECRET123')
+})
+
+// --- decisions as evidence ------------------------------------------------------
+
+/** Jev answering every question it is asked from `answer(key)`. */
+function jevBy(on: On, answer: (key: string) => number) {
+  const bodies: Record<string, unknown>[] = []
+  on('http.fetch', (_, e) => {
+    const body = JSON.parse(e.init?.body ?? '{}') as { questions?: Record<string, unknown> }
+    bodies.push(body)
+    const answers = Object.fromEntries(Object.keys(body.questions ?? {}).map(k => [k, { type: 'noul', noul: answer(k) }]))
+
+    return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ answers, usage: { input_tokens: 300 } }) } }
+  })
+
+  return bodies
+}
+
+/** The ledger's rows across its files. */
+const rowsOf = (files: Map<string, string>) =>
+  [...files.entries()]
+    .filter(([path]) => path.includes('/ledger/'))
+    .flatMap(([, text]) => text.trim().split('\n'))
+    .filter(Boolean)
+    .map(line => JSON.parse(line) as Record<string, unknown>)
+
+const ENV_ASK = {
+  tool: 'mcp__hcp__ask' as const,
+  title: 'Which environment for the smoke run?',
+  kind: 'env-choice',
+  options: [
+    { value: 'nprod', label: 'nprod' },
+    { value: 'prod', label: 'prod' },
+  ],
+  recommended: ['nprod'],
+}
+
+test('past answers on like decisions turn the shadow verdict to tell, and an override scores it wrong', async ($, on) => {
+  engine(on, KEYED)
+  const files = ledger(on)
+  on('fs.list', (_, e) => ({
+    value: [...files.keys()]
+      .filter(path => path.startsWith(`${e.path}/`))
+      .map(path => ({ name: path.slice(e.path!.length + 1), kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })),
+  }))
+  const before = (id: string) => ({
+    type: 'decision',
+    decision: { id, source: 'ask', kind: 'env-choice', title: 'Which environment?', choice: 'nprod', alternatives: ['nprod', 'prod'], session: 'old', at: 1, outcome: 'took' },
+  })
+  files.set('/home/me/.claude/hcp/ledger/2026-10-20.jsonl', ['c1', 'c2', 'c3', 'c4'].map(id => JSON.stringify(before(id))).join('\n') + '\n')
+  const bodies = jevBy(on, key => (key.startsWith('same_kind') ? 0.92 : key === 'reversible' ? 0.9 : 0.1))
+  await $.session.start({ cwd: '/work/hcp', surface: 'desktop', isInteractive: true })
+
+  const card = { id: idOf(await $.tool.call(ENV_ASK)) }
+  await settle()
+  const asked = bodies.find(b => (b.questions as Record<string, unknown>).same_kind_0) as { state: { precedents: unknown[] } }
+  expect(asked.state.precedents.length).toBe(4)
+  expect(JSON.stringify(asked.state)).not.toContain('took') // Jev never sees how the person answered
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: `${card.id}-opt-prod` })
+  await ui.press({ key: `${card.id}-send` })
+  await settle()
+  await ui.unmount()
+
+  const rows = rowsOf(files)
+  const shadowRow = rows.find(r => r.type === 'shadow' && r.decisionId === card.id)!
+  expect(shadowRow).toMatchObject({ pipeline: 'hcp-surface', verdict: 'tell', judgedBy: 'jev' })
+  const decided = rows.find(r => r.type === 'decision' && (r.decision as { id: string; session: string }).session !== 'old')!.decision
+  expect(decided).toMatchObject({ outcome: 'overrode', picked: 'prod', kind: 'env-choice', repo: 'hcp' })
+  expect(rows.find(r => r.type === 'score' && r.decisionId === card.id)).toMatchObject({ name: 'surfaced_right', value: 0, label: 'overrode' })
+
+  const report = (await $.command.run({ command: 'hcp', args: 'shadow', origin: { kind: 'composer' } } as never)).text ?? ''
+  expect(report).toContain('champion hcp-surface: would ask 0, tell 1, log 0. Right on 0/1')
+  expect(report).toContain('1 times it would have skipped asking when the person wanted a say')
+})
+
+test('a decision Claude records shows in the pane, and Disagree sends Claude back to check', async ($, on) => {
+  const submitted = engine(on, KEYED)
+  const files = ledger(on)
+  jevBy(on, () => 0.5)
+  await $.session.start({ cwd: '/work/hcp', surface: 'vscode', isInteractive: true })
+
+  const recorded = await $.tool.call({
+    tool: 'mcp__hcp__decided',
+    title: 'Which date library?',
+    choice: 'date-fns',
+    alternatives: ['dayjs', 'luxon'],
+    kind: 'library',
+    why: 'already a dependency',
+  } as never)
+  expect(String(recorded.result)).toMatch(/^Recorded d1\./)
+  await settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'vscode' })
+  expect(await ui.find({ type: 'Text', text: /Which date library\?/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /shadow would ask/ })).toBeDefined()
+
+  await ui.input({ key: 'd1-why', text: 'we are moving to Temporal' })
+  await settle()
+  expect(submitted[submitted.length - 1]).toBe(
+    '[HCP d1] I disagree with "Which date library?" (you chose date-fns). we are moving to Temporal Stop and check with me before building on it.',
+  )
+  expect(await ui.find({ type: 'Text', text: /you disagreed/ })).toBeDefined()
+  await ui.unmount()
+  const row = rowsOf(files).find(r => r.type === 'score')
+  expect(row).toMatchObject({ value: 1, label: 'disagreed' }) // the shadow said ask, and the person wanted a say
+})
+
+test('Claude writes a pipeline: problems come back to fix, a good one is saved, drawn, run, and a challenger is shadowed', async ($, on) => {
+  engine(on, KEYED)
+  const files = ledger(on)
+  jevBy(on, key => (key === 'breaking' ? 0.85 : 0.2))
+  await $.session.start({ cwd: '/work/hcp', surface: 'desktop', isInteractive: true })
+  const call = (input: Record<string, unknown>) => $.tool.call({ tool: 'mcp__hcp__pipeline', ...input } as never)
+
+  expect(String((await call({ action: 'describe' })).result)).toContain('hcp.precedents@1')
+  const bad = String((await call({ action: 'define', scope: 'external', spec: { id: 'x', nodes: {} } })).result)
+  expect(bad).toMatch(/^Not saved; fix every problem/)
+
+  const spec = {
+    id: 'release-risk',
+    fact: 'risk',
+    input: 'json',
+    output: 'json',
+    trigger: ['on-demand'],
+    group: 'release-{version}',
+    result: ['careful', 'ship'],
+    nodes: {
+      judge: { kind: 'decide', questions: 'release-risk', version: '1' },
+      gate: {
+        kind: 'code',
+        role: 'gate',
+        inputs: { b: 'judge.breaking' },
+        branches: ['careful', 'ship'],
+        thresholds: { breaking: 0.6 },
+        rules: [{ when: 'b[0] >= $t.breaking', branch: 'careful', reason: "'likely breaking'" }, { branch: 'ship', reason: "'looks safe'" }],
+        version: '1',
+      },
+      careful: { kind: 'code', role: 'derive', expr: '{ "advice": "stage it first" }', version: '1' },
+      ship: { kind: 'code', role: 'derive', expr: '{ "advice": "ship it" }', version: '1' },
+    },
+    edges: [
+      { from: 'judge', to: 'gate' },
+      { from: 'gate', to: 'careful', when: { gate: 'gate', branch: 'careful' } },
+      { from: 'gate', to: 'ship', when: { gate: 'gate', branch: 'ship' } },
+    ],
+    feedback: [
+      { id: 'outcome', from: 'surface:release', to: 'gate', source: 'explicit', scope: 'user', form: 'score', latency: 'deferred', score: { name: 'risk_right', dataType: 'BOOLEAN' } },
+    ],
+    eval: { dataset: 'release-eval', gateMetric: 'score_positive' },
+  }
+  const questions = { 'release-risk': { breaking: { type: 'noul', instructions: 'Does `input.changes` remove or rename anything users call?' } } }
+  const saved = String((await call({ action: 'define', scope: 'external', spec, questions })).result)
+  expect(saved).toContain('Saved release-risk')
+  expect(files.get('/home/me/.claude/hcp/pipelines/external/release-risk.svg')).toContain('<svg')
+  const ran = String((await call({ action: 'run', name: 'release-risk', input: { version: '0.3', changes: 'renamed ask to choose' } })).result)
+  expect(ran).toMatch(/^release-risk → careful, judged by jev/)
+  expect(ran).toContain('likely breaking')
+
+  // An internal challenger: the champion's spec with a stricter tell threshold, run in shadow on the next decision.
+  const strict = JSON.parse(JSON.stringify(SURFACE_SPEC)) as { id: string; nodes: { gate: { thresholds: Record<string, number> } } }
+  strict.id = 'hcp-surface-strict'
+  strict.nodes.gate.thresholds.tell = 0.95
+  expect(String((await call({ action: 'define', scope: 'internal', spec: strict })).result)).toContain('runs in shadow beside hcp-surface')
+  await $.tool.call(ENV_ASK)
+  await settle()
+  const shadows = rowsOf(files).filter(r => r.type === 'shadow').map(r => r.pipeline)
+  expect(shadows).toEqual(['hcp-surface', 'hcp-surface-strict'])
+})
+
+test('with Langfuse set, a run is a trace with a span per node, and the card answer is a score on that trace', async ($, on) => {
+  engine(on, {
+    ...KEYED,
+    HCP_LANGFUSE_PUBLIC_KEY: 'pk-lf-1',
+    HCP_LANGFUSE_SECRET_KEY: 'sk-lf-1',
+    HCP_LANGFUSE_BASE_URL: 'https://lf.example.com/',
+  })
+  tools(on)
+  ledger(on)
+  const posts: { url: string; auth: string; body: Record<string, unknown> }[] = []
+  on('http.fetch', (_, e) => {
+    posts.push({ url: e.url, auth: e.init?.headers?.authorization ?? '', body: JSON.parse(e.init?.body ?? '{}') as Record<string, unknown> })
+
+    return { value: { status: 207, ok: true, headers: {}, text: '{}' } }
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: COMMENT })
+  await settle()
+
+  const batch = posts.find(p => p.url === 'https://lf.example.com/api/public/ingestion')!
+  expect(batch.auth).toBe('Basic cGstbGYtMTpzay1sZi0x') // base64("pk-lf-1:sk-lf-1")
+  const events = batch.body.batch as { type: string; body: { id: string; traceId?: string; name: string; tags?: string[] } }[]
+  expect(events[0]).toMatchObject({ type: 'trace-create', body: { name: 'pipeline:hcp-reach', tags: expect.arrayContaining(['hcp', 'reach']) } })
+  const traceId = events[0]!.body.id
+  expect(events.filter(ev => ev.type === 'span-create').every(ev => ev.body.traceId === traceId)).toBe(true)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'r1-not-now' })
+  await settle()
+  await ui.unmount()
+  const score = posts.find(p => p.url === 'https://lf.example.com/api/public/scores')!
+  expect(score.body).toMatchObject({ traceId, name: 'hold_needed', value: 1, dataType: 'BOOLEAN' })
 })

@@ -6,7 +6,9 @@
 import type { EngineInterface } from 'claude-code'
 
 import { JEV_ENDPOINT, JEV_MODEL, checkJevRequest, jevAnswersToDecideResult, jevHeaders } from './vendor/dp.js'
-import type { DecideRequest, DecideResult, GenerateRequest, GenerateResult, JevQuestion, PipelinePorts } from './vendor/dp.js'
+import type { DecideRequest, DecideResult, GenerateRequest, GenerateResult, JevQuestion, PipelinePorts, ScoreRequest } from './vendor/dp.js'
+import { langfuseFrom, langfuseScore, langfuseTracer, secret } from './langfuse'
+import type { LangfuseConfig } from './langfuse'
 import { judgeState, questionsFor, redact } from './reach'
 import type { ReachInput } from './reach'
 
@@ -39,30 +41,10 @@ export function within<T>($: Engine, ms: number, work: Promise<T>): Promise<T> {
   })
 }
 
-/**
- * The Jev key: the session's environment first, then its line in
- * ~/.claude/.env, which Claude Code doesn't load. Never logged or shown.
- */
-export async function jevKey($: Engine): Promise<string | undefined> {
-  const fromEnv = await $.env.get('HCP_TYPESAFE_API_KEY')
-  if (fromEnv) return fromEnv
-  const home = await $.env.get('HOME')
-  if (!home) return undefined
-  try {
-    const line = (await $.fs.read(`${home}/.claude/.env`))
-      .split('\n')
-      .find(one => new RegExp(`^\\s*(export\\s+)?${KEY_NAME}\\s*=`).test(one))
-
-    return line?.slice(line.indexOf('=') + 1).trim().replace(/^["']|["']$/g, '') || undefined
-  } catch {
-    return undefined
-  }
-}
-
-async function jevDecide($: Engine, input: ReachInput, questions: Record<string, JevQuestion>): Promise<DecideResult> {
-  const key = await jevKey($)
+async function jevDecide($: Engine, state: unknown, questions: Record<string, JevQuestion>): Promise<DecideResult> {
+  const key = await secret($, 'HCP_TYPESAFE_API_KEY')
   if (key === undefined) throw new Error(`no ${KEY_NAME}`)
-  const body = { model: JEV_MODEL, state: judgeState(input), questions }
+  const body = { model: JEV_MODEL, state, questions }
   const problems = checkJevRequest(body)
   if (problems.length > 0) throw new Error(problems.join('; '))
   const response = await within(
@@ -84,13 +66,13 @@ const HAIKU_SYSTEM =
   'You estimate probabilities for a permission system. You get a JSON state and yes/no questions about it, keyed by name. ' +
   'Reply with one JSON object and nothing else, mapping every key to the probability (0 to 1) that the answer is yes.'
 
-async function haikuDecide($: Engine, input: ReachInput, questions: Record<string, JevQuestion>): Promise<DecideResult> {
+async function haikuDecide($: Engine, state: unknown, questions: Record<string, JevQuestion>): Promise<DecideResult> {
   const reply = await $.model.complete({
     model: 'haiku',
     effort: 'low',
     system: HAIKU_SYSTEM,
     prompt: JSON.stringify({
-      state: judgeState(input),
+      state,
       questions: Object.fromEntries(Object.entries(questions).map(([k, q]) => [k, q.instructions])),
     }),
     maxTokens: 200,
@@ -113,15 +95,24 @@ async function haikuDecide($: Engine, input: ReachInput, questions: Record<strin
 /** Which judge answered a run, and why the ones before it didn't. */
 export type Judged = { by: Judge | 'none' | 'rules'; problems: string[] }
 
+/** What a decide node shows the judge: one state, and the questions for this request. */
+export type Frame = (request: DecideRequest) => { state: unknown; questions: Record<string, JevQuestion> }
+
+/** The reach pipeline's frame: the call, and the grant it might fall under. */
+export const reachFrame: Frame = request => {
+  const input = request.input as ReachInput
+
+  return { state: judgeState(input), questions: questionsFor(input) as Record<string, JevQuestion> }
+}
+
 /**
- * The decide port: the questions this call needs, asked of Jev, then haiku.
- * Nothing to ask, or nobody answers: no distributions, and the level node
- * says so. It never throws, so a judge outage never fails the run.
+ * The decide port: the frame's questions, asked of Jev, then haiku. Nothing
+ * to ask, or nobody answers: no distributions, and the nodes after it say so.
+ * It never throws, so a judge outage never fails the run.
  */
-export function decidePort($: Engine, judge: Judge, judged: Judged) {
+export function decidePort($: Engine, judge: Judge, judged: Judged, frame: Frame = reachFrame) {
   return async (request: DecideRequest): Promise<DecideResult> => {
-    const input = request.input as ReachInput
-    const questions = questionsFor(input) as Record<string, JevQuestion>
+    const { state, questions } = frame(request)
     if (Object.keys(questions).length === 0) {
       judged.by = 'rules'
 
@@ -130,7 +121,7 @@ export function decidePort($: Engine, judge: Judge, judged: Judged) {
     const order: Judge[] = judge === 'jev' ? ['jev', 'haiku'] : judge === 'haiku' ? ['haiku'] : []
     for (const who of order) {
       try {
-        const result = who === 'jev' ? await jevDecide($, input, questions) : await haikuDecide($, input, questions)
+        const result = who === 'jev' ? await jevDecide($, state, questions) : await haikuDecide($, state, questions)
         judged.by = who
 
         return result
@@ -161,9 +152,9 @@ export const ROUTES: Record<string, Route> = {
 }
 
 /** The generate port: one completion on the session's own client, by route. */
-export function generatePort($: Engine) {
+export function generatePort($: Engine, routes: Record<string, Route> = ROUTES) {
   return async (request: GenerateRequest): Promise<GenerateResult> => {
-    const route = ROUTES[request.route]
+    const route = routes[request.route]
     if (route === undefined) throw new Error(`no route "${request.route}"`)
     const reply = await $.model.complete({
       model: route.model,
@@ -184,22 +175,44 @@ export function generatePort($: Engine) {
   }
 }
 
-/** The ports a reach run uses; `records` and `scores` land in the caller's hands for the ledger. */
+let langfuse: LangfuseConfig | undefined
+
+/** Reads the Langfuse project at session start; without all three HCP_LANGFUSE_* variables, runs stay local. */
+export async function initObservability($: Engine) {
+  langfuse = await langfuseFrom($)
+
+  return langfuse !== undefined
+}
+
+/** A tracer for one run, when Langfuse is configured: the run id becomes its trace id. */
+export function tracerFor($: Engine, tags: readonly string[] = []): Pick<PipelinePorts, 'tracer'> {
+  return langfuse ? { tracer: langfuseTracer($, langfuse, ['hcp', ...tags]) } : {}
+}
+
+/** Feedback lands twice: a ledger row always, a Langfuse score on the run's trace when configured. */
+export function scoresPort($: Engine, row: Record<string, unknown>) {
+  return async (score: ScoreRequest) => {
+    await appendLedger($, { type: 'score', ...row, ...score })
+    if (langfuse) await langfuseScore($, langfuse, score)
+  }
+}
+
+/** The ports a reach run uses; `records` lands in the caller's hands for the ledger. */
 export function reachPorts($: Engine, judge: Judge, judged: Judged, sink: PipelinePorts['records']): PipelinePorts {
-  return { decide: decidePort($, judge, judged), generate: generatePort($), records: sink, clock: () => Date.now() }
+  return { ...tracerFor($, ['reach']), decide: decidePort($, judge, judged), generate: generatePort($), records: sink, clock: () => Date.now() }
 }
 
 // One write at a time, so two runs finishing together don't drop a line.
 let writing: Promise<void> = Promise.resolve()
 
-/** Appends one JSON line to today's ledger, ~/.claude/hcp/ledger/<yyyy-mm-dd>.jsonl. Best effort. */
-export function appendLedger($: Engine, row: Record<string, unknown>): Promise<void> {
+/** Appends one JSON line to ~/.claude/hcp/<path>, `{name}` filled with today's date. Best effort. */
+export function appendJsonl($: Engine, path: string, row: Record<string, unknown>): Promise<void> {
   writing = writing.then(async () => {
     try {
       const home = await $.env.get('HOME')
       if (!home) return
       const at = await $.clock.now()
-      const file = `${home}/.claude/hcp/ledger/${new Date(at).toISOString().slice(0, 10)}.jsonl`
+      const file = `${home}/.claude/hcp/${path.replace('{date}', new Date(at).toISOString().slice(0, 10))}`
       const was = (await $.fs.exists(file)) ? await $.fs.read(file) : ''
       await $.fs.write(file, `${was}${JSON.stringify({ at, ...row })}\n`)
     } catch {
@@ -208,4 +221,9 @@ export function appendLedger($: Engine, row: Record<string, unknown>): Promise<v
   })
 
   return writing
+}
+
+/** Appends one row to today's ledger, ~/.claude/hcp/ledger/<yyyy-mm-dd>.jsonl. */
+export function appendLedger($: Engine, row: Record<string, unknown>) {
+  return appendJsonl($, 'ledger/{date}.jsonl', row)
 }

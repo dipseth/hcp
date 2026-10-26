@@ -9,6 +9,8 @@ export type DecideRequest = {
   nodeVersion: string
   questions: string | null
   input: unknown
+  /** Upstream outputs, by node id. */
+  from: Record<string, unknown>
   signal?: AbortSignal
 }
 
@@ -67,9 +69,28 @@ export type RunResult = {
   skipped: Record<string, string>
 }
 
+export type StoreRequest = { nodeId: string; target: string; fact: string; value: unknown; route: string; runId: string | null }
+
+export type SpanHandle = {
+  readonly traceId: string | null
+  setMetadata(metadata: Record<string, unknown>): void
+  setOutput(output: unknown): void
+  setTags?(tags: readonly string[]): void
+}
+
+export type TracePort = {
+  root<T>(
+    opts: { name: string; input: unknown; group: string; tags: string[]; metadata: Record<string, unknown>; userId?: string | null },
+    fn: (span: SpanHandle) => Promise<T>,
+  ): Promise<T>
+  span<T>(opts: { name: string; input: unknown; metadata: Record<string, unknown> }, fn: (span: SpanHandle) => Promise<T>): Promise<T>
+}
+
 export type PipelinePorts = {
+  tracer?: TracePort
   decide?: (request: DecideRequest) => Promise<DecideResult>
   generate?: (request: GenerateRequest) => Promise<GenerateResult>
+  store?: (request: StoreRequest) => Promise<void> | void
   records?: (record: RunRecord) => Promise<void> | void
   scores?: (request: ScoreRequest) => Promise<void> | void
   clock?: () => number
@@ -129,3 +150,26 @@ export const jevAnswersToDecideResult: (
 
 export const stableStringify: (value: unknown) => string
 export const sha256Hex: (input: string) => string
+
+/** A JSON spec's compiler: every problem at once, or the pipeline. */
+export type CompileResult = { pipeline: Pipeline | null; problems: string[] }
+export type ExpressionEngine = { readonly name?: string }
+export type SpecRegistry = { readonly primitives: Readonly<Record<string, unknown>> }
+
+export const defineRegistry: (parts: {
+  primitives?: {
+    id: string
+    version: string
+    describe: string
+    args: Schema
+    run: (args: never, ctx: { input: unknown; thresholds: Readonly<Record<string, number>> }) => unknown
+  }[]
+  functions?: Record<string, { describe: string; fn: (...args: never[]) => unknown }>
+  schemas?: Record<string, Schema>
+}) => SpecRegistry
+export const compilePipelineSpec: (json: unknown, registry: SpecRegistry, engine: ExpressionEngine) => CompileResult
+export const describeRegistry: (registry: SpecRegistry) => unknown
+export const jsonataEngine: (options?: { timeoutMs?: number; maxDepth?: number }) => ExpressionEngine
+export const renderPipelineSvg: (json: unknown, options?: { title?: string; standalone?: boolean }) => string
+/** A stable number in [0, 1) for a string: deterministic assignment. */
+export const hashToUnit: (input: string) => number

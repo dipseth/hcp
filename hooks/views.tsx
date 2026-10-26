@@ -5,7 +5,7 @@
 
 import type { ElementTable, RenderSurface } from 'claude-code'
 
-import type { HcpCard, HcpDelivery, HcpGrant, HcpMedia, HcpMode, HcpOutward, HcpScheduled } from '../types'
+import type { HcpCard, HcpDecision, HcpDelivery, HcpGrant, HcpMedia, HcpMode, HcpOutward, HcpScheduled } from '../types'
 import { STEERS, clip, labels, services } from './model'
 import type { ReachChoice, Steer } from './model'
 
@@ -42,6 +42,9 @@ export type Actions = {
   /** The person's answer to a held call. */
   reach: (id: string, choice: ReachChoice, note?: string) => void
   revokeGrant: (id: string) => void
+  /** A decision Claude recorded: keep it, or tell Claude to stop and check. */
+  agree: (id: string) => void
+  disagree: (id: string) => void
 }
 
 export type Snapshot = {
@@ -63,6 +66,8 @@ export type Snapshot = {
   /** Calls that left the machine or were held this session, newest first. */
   outward: HcpOutward[]
   now: number
+  /** Decisions Claude recorded itself, newest first. */
+  decided: HcpDecision[]
 } & Pictures
 
 /** How pictures draw: the terminal's Image reads files, other surfaces' Svg carries bytes. */
@@ -636,6 +641,49 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
           ))}
         </Box>
       </Box>
+
+      {s.decided.length > 0 && (
+        <Box flexDirection="column">
+          {section('Claude decided')}
+          {s.decided.map(d => {
+            const surface = d.shadow?.['hcp-surface']
+
+            return (
+              <Box key={`decided-${d.id}`} flexDirection="column">
+                <Text>
+                  {badge(els, d.id, THEME.ask)} {d.title} <Text bold>→ {d.choice}</Text>
+                  {d.why ? <Text dimColor> · {clip(d.why, 80)}</Text> : ''}
+                </Text>
+                {surface && (
+                  <Text dimColor>
+                    shadow would {surface.verdict}: {clip(surface.reason, 90)}
+                  </Text>
+                )}
+                {d.outcome === 'pending' ? (
+                  <Box flexDirection="row" gap={1} flexWrap="wrap">
+                    <Button key={`${d.id}-agree`} label="👍 Fine" onPress={() => act.agree(d.id)} />
+                    <Button key={`${d.id}-disagree`} label="✋ Disagree" onPress={() => act.disagree(d.id)} />
+                    {Input && (
+                      <Input
+                        key={`${d.id}-why`}
+                        placeholder="Why not (optional), Enter disagrees"
+                        submitLabel="disagree"
+                        onInput={value => act.draft(d.id, value)}
+                        onSubmit={value => {
+                          act.draft(d.id, value)
+                          act.disagree(d.id)
+                        }}
+                      />
+                    )}
+                  </Box>
+                ) : (
+                  <Text dimColor>{d.outcome === 'agreed' ? '✓ you kept it' : d.outcome === 'disagreed' ? '✋ you disagreed' : d.outcome}</Text>
+                )}
+              </Box>
+            )
+          })}
+        </Box>
+      )}
 
       {s.grants.length > 0 && (
         <Box flexDirection="column">

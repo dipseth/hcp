@@ -9,6 +9,7 @@ entry=$(mktemp -t dp-entry).ts
 cat > "$entry" <<ENTRY
 export * from "$repo/src/index";
 export { testPorts } from "$repo/src/testing";
+export { jsonataEngine } from "$repo/src/jsonata";
 export { z } from "$repo/node_modules/zod";
 ENTRY
 cd "$repo" && npx esbuild "$entry" --bundle --format=esm --platform=neutral --target=es2023 \

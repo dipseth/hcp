@@ -1,6 +1,6 @@
 {
   "name": "hcp",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Human Context Protocol: clickable cards, handoffs, no-reply notes, and a reach contract that holds calls contacting people for your OK",
   "types": "./types/index.d.ts"
 }
