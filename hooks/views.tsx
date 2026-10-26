@@ -6,7 +6,7 @@
 import type { ElementTable, RenderSurface } from 'claude-code'
 
 import type { HcpCard, HcpDelivery, HcpMedia, HcpMode, HcpScheduled } from '../types'
-import { SERVICES, STEERS, clip } from './model'
+import { STEERS, clip, labels, services } from './model'
 import type { Steer } from './model'
 
 export type Actions = {
@@ -280,7 +280,7 @@ export function cardView(els: ElementTable, card: HcpCard, act: Actions, ctx: Ca
   const Input = 'Input' in els ? els.Input : undefined
   const id = card.id
   const color = THEME[card.kind]
-  const service = card.service === undefined ? undefined : SERVICES[card.service]
+  const service = card.service === undefined ? undefined : services()[card.service]
   const laterLabel = ctx.laterLabel
   const key = (hotkey: string) => (ctx.hasKeys ? { hotkey } : {})
   const later = (
@@ -342,8 +342,8 @@ export function cardView(els: ElementTable, card: HcpCard, act: Actions, ctx: Ca
       </Box>
     ) : card.kind === 'share' ? (
       <Box flexDirection="row" flexWrap="wrap" gap={1}>
-        <Button key={`${id}-copy-rich`} label="Copy formatted" variant="primary" {...key('s')} onPress={() => act.copy(id, true)}>
-          {big(els, '📋 Copy formatted', color)}
+        <Button key={`${id}-copy-rich`} label={labels().copyRich} variant="primary" {...key('s')} onPress={() => act.copy(id, true)}>
+          {big(els, `📋 ${labels().copyRich}`, color)}
         </Button>
         <Button key={`${id}-copy-plain`} label="Copy plain" onPress={() => act.copy(id, false)} />
         <Button key={`${id}-finish`} label="Done" dimColor onPress={() => act.finish(id)} />

@@ -12,12 +12,11 @@ import {
   ASK_TOOL,
   HANDOFF_TOOL,
   MAX_MEDIA,
-  PROTOCOL,
-  SERVICES,
   SHARE_TOOL,
   STEERS,
   VIDEO_FILE,
   answerText,
+  applyExtensions,
   attachedText,
   autoHandoffNote,
   cantText,
@@ -28,15 +27,19 @@ import {
   markdownToHtml,
   markdownToPlain,
   needsAuthServers,
+  parseExtension,
   parseMedia,
   parseOffset,
   parseOptions,
   parseWhen,
   postedText,
+  protocolText,
+  services,
   smartLater,
   splitPaths,
+  withTweak,
 } from './model'
-import type { Steer, When } from './model'
+import type { Extension, Steer, When } from './model'
 import { cardView, inbox } from './views'
 import type { Actions, Snapshot } from './views'
 
@@ -168,7 +171,7 @@ async function postCard($: Engine, fields: Omit<HcpCard, 'id' | 'status' | 'note
 const blank = { options: [], isMulti: false, picked: [] }
 
 async function raiseAuthHandoff($: Engine, name: string, toolUseId: string | undefined, command: string, agentId?: string) {
-  const service = SERVICES[name]!
+  const service = services()[name]!
   const isOpen = (await read($, cards)).some(c => c.kind === 'handoff' && c.service === name && c.status === 'open')
   if (isOpen) return
   const card = await postCard($, {
@@ -393,7 +396,7 @@ async function verifyThenAnswer($: Engine, id: string) {
 
     return
   }
-  const service = card?.service === undefined ? undefined : SERVICES[card.service]
+  const service = card?.service === undefined ? undefined : services()[card.service]
   if (!card || !service) {
     await answerCard($, id, 'now')
 
@@ -638,6 +641,36 @@ async function snapshot($: Engine, surface: RenderSurface): Promise<Snapshot> {
   }
 }
 
+const DEFAULT_EXTENSION = '~/.claude/hcp.json'
+
+/**
+ * Layers the extension files over the base: `HCP_EXTENSIONS` (paths joined by
+ * `:`, read in order) or else ~/.claude/hcp.json. A missing default is fine;
+ * a missing named file or a malformed one is reported in a toast.
+ */
+async function loadExtensions($: Engine) {
+  const home = (await $.env.get('HOME')) ?? ''
+  const named = (await $.env.get('HCP_EXTENSIONS'))?.trim()
+  const paths = named ? named.split(':').filter(Boolean) : [DEFAULT_EXTENSION]
+  const loaded: Partial<Extension>[] = []
+  const problems: string[] = []
+  for (const path of paths) {
+    const full = path.startsWith('~/') ? `${home}/${path.slice(2)}` : path
+    let json: string
+    try {
+      json = await $.fs.read(full)
+    } catch {
+      if (named) problems.push(`${path}: can't read it`)
+      continue
+    }
+    const parsed = parseExtension(json)
+    loaded.push(parsed.extension)
+    problems.push(...parsed.problems.map(p => `${path}: ${p}`))
+  }
+  applyExtensions(loaded)
+  if (problems.length > 0) $.ui.toast(`hcp extension: ${problems.join('; ')}`, { timeoutMs: 15_000 })
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     try {
@@ -646,11 +679,12 @@ export const register: Register = on => {
     } catch {
       // No process access (tests, a restricted host): keep the environment's own offset.
     }
+    await loadExtensions($)
 
     await Promise.all([
-      $.tool.register(ASK_TOOL),
-      $.tool.register(HANDOFF_TOOL),
-      $.tool.register(SHARE_TOOL),
+      $.tool.register(withTweak(ASK_TOOL)),
+      $.tool.register(withTweak(HANDOFF_TOOL)),
+      $.tool.register(withTweak(SHARE_TOOL)),
       $.command.register({
         name: 'hcp',
         description: 'Open the HCP pane: cards waiting on you, quick replies, steers, mode',
@@ -693,7 +727,7 @@ export const register: Register = on => {
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
 
-    return { sections: [...composed.sections, { id: 'hcp:protocol', text: PROTOCOL, scope: 'session' as const }] }
+    return { sections: [...composed.sections, { id: 'hcp:protocol', text: protocolText(), scope: 'session' as const }] }
   })
 
   on('tool.call', { tool: 'mcp__hcp__ask' }, async ($, e) => {

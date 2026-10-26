@@ -3,17 +3,21 @@
 
 import type { HcpCard, HcpDelivery, HcpMedia, HcpOption } from '../types'
 
-export const PROTOCOL = `# Human Context Protocol (hcp mod)
+const PROTOCOL_HEAD = `# Human Context Protocol (hcp mod)
 
 The person has an HCP surface: clickable cards drawn inline in the chat and in an "HCP" pane. Use it whenever you need something from them, instead of prose.
+`
 
-- A decision among discrete options (approach, environment, scope, yes/no, approving a draft): call mcp__hcp__ask. Put a draft issue, comment or plan in \`draft\`. Don't restate the options after the call.
-- Text the person will paste elsewhere (a Slack message, an email, a PR description, a status update): call mcp__hcp__share instead of printing it for them to select. It is outward-facing: write it for its audience.
-- A step only they can do (an interactive login, VPN, an access request, /mcp auth, running something locally): call mcp__hcp__handoff. Auth failures from gcloud/bq in Bash, and MCP servers that need authorizing, are raised as handoffs for you, and you'll get a note saying so: don't retry the command, debug it, or run the login yourself.
-- Cards don't block. Keep going on work that doesn't need the answer, or end your turn with one short line.
-- Pictures belong on the card: pass screenshots, renders or charts the person should look at in \`media\` (absolute paths, a one-line \`caption\` each; a video is sampled into frames) on any of the three tools, instead of describing them in prose.
-- A message ending in "Attached, view each with Read before acting:" carries the person's images or video frames: Read every listed path before you answer.
+const protocolRules = (watched: string) => [
+  '- A decision among discrete options (approach, environment, scope, yes/no, approving a draft): call mcp__hcp__ask. Put a draft issue, comment or plan in `draft`. Don\'t restate the options after the call.',
+  '- Text the person will paste elsewhere (a Slack message, an email, a PR description, a status update): call mcp__hcp__share instead of printing it for them to select. It is outward-facing: write it for its audience.',
+  `- A step only they can do (an interactive login, VPN, an access request, /mcp auth, running something locally): call mcp__hcp__handoff. Auth failures from ${watched} in Bash, and MCP servers that need authorizing, are raised as handoffs for you, and you'll get a note saying so: don't retry the command, debug it, or run the login yourself.`,
+  "- Cards don't block. Keep going on work that doesn't need the answer, or end your turn with one short line.",
+  '- Pictures belong on the card: pass screenshots, renders or charts the person should look at in `media` (absolute paths, a one-line `caption` each; a video is sampled into frames) on any of the three tools, instead of describing them in prose.',
+  '- A message ending in "Attached, view each with Read before acting:" carries the person\'s images or video frames: Read every listed path before you answer.',
+]
 
+const PROTOCOL_MESSAGES = `
 Messages from the surface start with "[HCP":
 - "[HCP c3] ..." is the person's answer, sent to start a turn: act on it.
 - "[HCP c3 · NNTR] ..." needs no reply. Take it into account and carry on; don't acknowledge it, and don't start new work because of it alone.
@@ -23,6 +27,13 @@ Messages from the surface start with "[HCP":
   - heads-down: batch your questions into one card, keep updates to a line, don't ask about anything reversible.
   - away: don't wait on answers. Take safe, reversible defaults; leave questions as cards; make no outward-facing write (issues, PRs, Slack, deploys) until they're back.
 - "[HCP concise] on" means short replies and no recaps until it says off.`
+
+/** What Claude is told, with the watched logins and any extension's rules. */
+export function protocolText(): string {
+  const rules = [...protocolRules(watchedLabels()), ...current.protocol]
+
+  return `${PROTOCOL_HEAD}\n${rules.join('\n')}\n${PROTOCOL_MESSAGES}`
+}
 
 type Schema = Record<string, unknown>
 
@@ -91,7 +102,7 @@ export const ASK_TOOL = {
 export const HANDOFF_TOOL = {
   name: 'handoff',
   description:
-    "Hand the person a step only they can do (an interactive login, VPN, an access request, /mcp auth, running something on their machine) as a card with Done / Later / Can't buttons, instead of explaining it in prose. gcloud/bq auth failures in Bash are raised for you; don't call this for those. Returns at once: carry on with work that doesn't need it, or end your turn in one line.",
+    "Hand the person a step only they can do (an interactive login, VPN, an access request, /mcp auth, running something on their machine) as a card with Done / Later / Can't buttons, instead of explaining it in prose. Returns at once: carry on with work that doesn't need it, or end your turn in one line.",
   inputSchema: {
     type: 'object',
     properties: {
@@ -108,7 +119,7 @@ export const HANDOFF_TOOL = {
 export const SHARE_TOOL = {
   name: 'share',
   description:
-    "Hand the person text to paste somewhere else (a Slack message, an email, a PR description, a status update) as a card with Copy buttons, instead of printing it for them to select. Copy formatted puts HTML on the clipboard, so bold, lists and links survive the paste into Slack, email or a doc. Write it for its audience, in markdown. It is outward-facing. Returns at once; a requested change arrives as \"[HCP <id>] …\".",
+    "Hand the person text to paste somewhere else (a Slack message, an email, a PR description, a status update) as a card with Copy buttons, instead of printing it for them to select. The formatted copy puts HTML on the clipboard, so bold, lists and links survive the paste into Slack, email or a doc. Write it for its audience, in markdown. It is outward-facing. Returns at once; a requested change arrives as \"[HCP <id>] …\".",
   inputSchema: {
     type: 'object',
     properties: {
@@ -146,14 +157,152 @@ export const SERVICES: Record<string, Service> = {
   },
 }
 
+/** Words on the surface an extension may change. */
+export type Labels = { copyRich: string }
+
+export const LABELS: Labels = { copyRich: 'Copy formatted' }
+
+/** Appended to a tool's description; `properties` replaces a property's description. */
+export type ToolTweak = { append?: string; properties?: Record<string, string> }
+
+/**
+ * An environment's layer over the base: protocol rules, watched logins, tool
+ * wording and labels. Read from JSON at session start; see the README.
+ */
+export type Extension = {
+  protocol: string[]
+  services: Record<string, Service>
+  tools: Record<string, ToolTweak>
+  labels: Partial<Labels>
+}
+
+type Layered = { protocol: string[]; services: Record<string, Service>; tools: Record<string, ToolTweak>; labels: Labels }
+
+const base = (): Layered => ({ protocol: [], services: { ...SERVICES }, tools: {}, labels: { ...LABELS } })
+
+let current = base()
+
+/** The watched logins, base and extensions together. */
+export const services = () => current.services
+
+export const labels = () => current.labels
+
+/** Back to the base, then each extension in order: a later one wins a service or label. */
+export function applyExtensions(list: readonly Partial<Extension>[]) {
+  const next = base()
+  for (const ext of list) {
+    next.protocol.push(...(ext.protocol ?? []))
+    Object.assign(next.services, ext.services)
+    Object.assign(next.labels, ext.labels)
+    for (const [name, tweak] of Object.entries(ext.tools ?? {})) {
+      const was = next.tools[name] ?? {}
+      next.tools[name] = {
+        append: [was.append, tweak.append].filter(Boolean).join(' ') || undefined,
+        properties: { ...was.properties, ...tweak.properties },
+      }
+    }
+  }
+  current = next
+}
+
+const strings = (raw: unknown) => (Array.isArray(raw) ? raw.filter((s): s is string => typeof s === 'string') : [])
+
+/**
+ * An extension file's JSON, keeping what is well formed. A service names its
+ * `pattern` (and optional `command`) as case-insensitive regex source; without
+ * `command` any Bash command counts.
+ */
+export function parseExtension(json: string): { extension: Partial<Extension>; problems: string[] } {
+  const problems: string[] = []
+  let raw: Record<string, unknown>
+  try {
+    raw = JSON.parse(json) as Record<string, unknown>
+  } catch (error) {
+    return { extension: {}, problems: [`not JSON: ${(error as Error).message}`] }
+  }
+  const extension: Partial<Extension> = {}
+
+  if (raw.protocol !== undefined) extension.protocol = strings(raw.protocol)
+
+  if (raw.services !== undefined && typeof raw.services === 'object' && raw.services !== null) {
+    extension.services = {}
+    for (const [name, spec] of Object.entries(raw.services as Record<string, Record<string, unknown>>)) {
+      const verify = strings(spec?.verify)
+      if (typeof spec?.label !== 'string' || typeof spec.fix !== 'string' || typeof spec.pattern !== 'string' || verify.length === 0) {
+        problems.push(`service ${name} needs label, fix, pattern and verify`)
+        continue
+      }
+      try {
+        const pattern = new RegExp(spec.pattern, 'i')
+        const command = typeof spec.command === 'string' ? new RegExp(spec.command) : undefined
+        extension.services[name] = {
+          label: spec.label,
+          fix: spec.fix,
+          verify,
+          isRunnable: spec.runnable === true,
+          isCommand: c => command?.test(c) ?? true,
+          pattern,
+        }
+      } catch (error) {
+        problems.push(`service ${name}: ${(error as Error).message}`)
+      }
+    }
+  }
+
+  if (raw.tools !== undefined && typeof raw.tools === 'object' && raw.tools !== null) {
+    extension.tools = {}
+    for (const [name, tweak] of Object.entries(raw.tools as Record<string, Record<string, unknown>>)) {
+      const properties = Object.fromEntries(
+        Object.entries((tweak?.properties ?? {}) as Record<string, unknown>).filter(
+          (entry): entry is [string, string] => typeof entry[1] === 'string',
+        ),
+      )
+      extension.tools[name] = { ...(typeof tweak?.append === 'string' ? { append: tweak.append } : {}), properties }
+    }
+  }
+
+  if (raw.labels !== undefined && typeof raw.labels === 'object' && raw.labels !== null) {
+    const l = raw.labels as Record<string, unknown>
+    extension.labels = typeof l.copyRich === 'string' ? { copyRich: l.copyRich } : {}
+  }
+
+  return { extension, problems }
+}
+
+type ToolDef = { name: string; description: string; inputSchema: { properties: Record<string, unknown> } & Schema; isDeferred: boolean }
+
+/** A tool as registered: the base with its extension tweak applied. */
+export function withTweak<T extends ToolDef>(tool: T): T {
+  const handled = tool.name === 'handoff' ? ` ${watchedLabels()} auth failures in Bash are raised for you; don't call this for those.` : ''
+  const tweak = current.tools[tool.name]
+  const properties = { ...tool.inputSchema.properties }
+  for (const [prop, description] of Object.entries(tweak?.properties ?? {})) {
+    const was = properties[prop] as Record<string, unknown> | undefined
+    if (was !== undefined) properties[prop] = { ...was, description }
+  }
+
+  return {
+    ...tool,
+    description: [tool.description + handled, tweak?.append].filter(Boolean).join(' '),
+    inputSchema: { ...tool.inputSchema, properties },
+  }
+}
+
+/** `gcloud / bq, twg and glab`: the logins whose failure raises a handoff. */
+export function watchedLabels(): string {
+  const names = Object.values(current.services).map(s => s.label)
+
+  return names.length <= 1 ? (names[0] ?? 'no CLI') : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`
+}
+
 /**
  * The service whose credentials a failed Bash call ran into. `scanned` is
  * stderr for a call that succeeded and the whole output for one that failed,
  * so a grep that prints "gcloud auth login" never counts.
  */
 export function detectService(command: string, scanned: string): string | undefined {
-  return Object.keys(SERVICES).find(name => {
-    const service = SERVICES[name]!
+  return Object.keys(current.services).find(name => {
+    const service = current.services[name]!
 
     return service.isCommand(command) && service.pattern.test(scanned)
   })
@@ -210,7 +359,7 @@ export const deferText = (card: HcpCard, when: string) =>
   `[HCP ${card.id} · NNTR] Will do "${card.title}" around ${when}. Don't wait on it; carry on with what doesn't need it.`
 
 const serviceLabel = (service: string | undefined) =>
-  service?.startsWith('mcp:') ? `The ${service.slice(4)} MCP server` : `${SERVICES[service ?? '']?.label ?? service}`
+  service?.startsWith('mcp:') ? `The ${service.slice(4)} MCP server` : `${current.services[service ?? '']?.label ?? service}`
 
 export const autoHandoffNote = (card: HcpCard) =>
   `[HCP ${card.id}] ${serviceLabel(card.service)} needs the person to authenticate. A handoff card is up and the person has been notified. Don't retry the command, debug it, or run the login yourself: carry on with work that doesn't need it, or end your turn in one line. "[HCP ${card.id}] Done" arrives when it's fixed.`

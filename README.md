@@ -41,9 +41,35 @@ Clickable seams between you and Claude, so a decision is a click instead of a pa
 
 Scheduled messages live as long as the session: closing it drops them.
 
-## Adding a watched login
+## Extending it for your environment
 
-`SERVICES` in `hooks/model.ts` lists each CLI whose expired login should raise a handoff: a `pattern` matched against the failed Bash output, an `isCommand` guard, the `fix` command, and a read-only `verify` command that exits 0 once credentials work. Only gcloud/bq is listed; add an entry for any other CLI you use.
+The base knows one watched login (gcloud/bq) and generic wording. An environment adds its own in a JSON extension file, without forking the code. hcp reads `~/.claude/hcp.json` at session start, or the files named in `HCP_EXTENSIONS` (paths joined by `:`, layered in order, a later one winning). Each key is optional:
+
+```json
+{
+  "protocol": ["- Share text usually goes to Teams; name no customers."],
+  "services": {
+    "glab": {
+      "label": "glab (GitLab)",
+      "fix": "glab auth login",
+      "verify": ["glab", "auth", "status"],
+      "command": "\\bglab\\b",
+      "pattern": "glab auth login|not logged in|\\b401\\b"
+    }
+  },
+  "tools": {
+    "share": { "append": "Usually for Teams.", "properties": { "audience": "Teams channel or email." } }
+  },
+  "labels": { "copyRich": "Copy for Teams" }
+}
+```
+
+- **protocol**: lines added to the rules Claude is told, after the base ones.
+- **services**: CLIs whose expired login raises a handoff. `pattern` is matched, case-insensitively, against the failed Bash output; `command`, if given, must match the Bash command too; `fix` is what the person runs; `verify` is a read-only command that exits 0 once credentials work; `"runnable": true` lets the card's **Run it** start `fix` itself (only for logins that need no terminal). The same name as a base service replaces it. Claude's protocol and the handoff tool's description list every watched login.
+- **tools**: per tool (`ask`, `handoff`, `share`), text appended to its description and replacement descriptions for its properties.
+- **labels**: `copyRich`, the share card's formatted-copy button.
+
+A malformed file, or a named one that can't be read, is reported in a toast and skipped.
 
 ## Install
 

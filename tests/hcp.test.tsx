@@ -17,17 +17,27 @@ declare const setTimeout: (fn: () => void, ms: number) => unknown
 const settle = () => new Promise<void>(resolve => setTimeout(resolve, 50))
 
 /** Stands in for the engine beneath the plugin, and records what it was asked to send. */
-function engine(on: On) {
+function engine(on: On, env: Record<string, string> = { HOME: '/nonexistent' }) {
   const submitted: string[] = []
-  on('tool.register', (_, e) => ({ value: { tool: `mcp__hcp__${e.name}` } }))
+  const registered: Record<string, string> = {}
+  const toasts: string[] = []
+  on('tool.register', (_, e) => {
+    registered[e.name] = e.description
+
+    return { value: { tool: `mcp__hcp__${e.name}` } }
+  })
   on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('ui.panes', () => ({ value: [] }))
   on('ui.status', () => ({ value: undefined }))
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', (_, e) => {
+    toasts.push(e.text)
+
+    return { value: undefined }
+  })
   on('ui.notify', () => ({ value: { isSent: false as const, reason: 'no-surface' as const } }))
   mock.clock(on, { now: Date.UTC(2026, 9, 22, 16, 0) })
-  mock.env(on, { HOME: '/nonexistent' })
+  mock.env(on, env)
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('prompt.submit', (_, e) => {
     submitted.push(e.text)
@@ -35,7 +45,7 @@ function engine(on: On) {
     return { text: e.text }
   })
 
-  return submitted
+  return Object.assign(submitted, { registered, toasts })
 }
 
 const PANE = {
@@ -385,4 +395,44 @@ test('a share copies as paste-ready HTML and plain text, and MCP auth parses', (
   const now = Date.UTC(2026, 9, 22)
   expect(needsAuthServers(`{"gitlab":{"timestamp":${now - 1000}},"old":{"timestamp":0}}`, now)).toEqual(['gitlab'])
   expect(needsAuthServers('not json', now)).toEqual([])
+})
+
+test('an extension file adds a watched login, protocol rules and wording', async ($, on) => {
+  const { registered, toasts } = engine(on, { HOME: '/home/me', HCP_EXTENSIONS: '~/team.json' })
+  on('fs.read', (_, e) =>
+    e.path === '/home/me/team.json'
+      ? {
+          value: JSON.stringify({
+            protocol: ['- Shared text names no customers.'],
+            services: {
+              twg: { label: 'twg', fix: 'twg login', verify: ['twg', 'whoami'], command: '\\btwg\\b', pattern: 'not logged in' },
+              broken: { label: 'broken' },
+            },
+            tools: { share: { append: 'Usually for Teams.', properties: { audience: 'Teams channel or email.' } } },
+            labels: { copyRich: 'Copy for Teams' },
+          }),
+        }
+      : { deny: `ENOENT: ${e.path}` },
+  )
+  on('prompt.compose', () => ({ sections: [] }))
+  on('tool.call', () => ({ isError: true as const, result: 'Error: not logged in', text: 'Error: not logged in' }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  expect(registered.handoff).toContain('gcloud / bq and twg auth failures')
+  expect(registered.share).toContain('Usually for Teams.')
+  expect(toasts.some(t => t.includes('service broken needs'))).toBe(true)
+  const protocol = (
+    await $.prompt.compose({ model: 'm', promptModel: 'm', surfaces: ['desktop'], tools: [], outputStyle: null, traits: [] })
+  ).sections.find(s => s.id === 'hcp:protocol')?.text ?? ''
+  expect(protocol).toContain('- Shared text names no customers.')
+  expect(protocol).toContain('Auth failures from gcloud / bq and twg in Bash')
+
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  await $.tool.call({ tool: 'Bash', command: 'twg jira workitem view IS-1' })
+  await $.tool.call({ tool: 'mcp__hcp__share', title: 'Note', text: 'hi' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Re-authenticate twg/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Waiting on you \(2\)/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Copy for Teams/ })).toBeDefined()
+  await ui.unmount()
 })
