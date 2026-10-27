@@ -45,6 +45,8 @@ export type Actions = {
   /** A decision Claude recorded: keep it, or tell Claude to stop and check. */
   agree: (id: string) => void
   disagree: (id: string) => void
+  /** Replace Claude's recorded choice with the person's own. */
+  change: (id: string, text?: string) => void
 }
 
 export type Snapshot = {
@@ -361,8 +363,19 @@ function reachCard(els: ElementTable, card: HcpCard, act: Actions, ctx: CardCont
       </Box>
       {Input && (
         <Input
+          key={`${id}-edit`}
+          label="Edit:"
+          value={r.content}
+          rows={Math.min(8, Math.max(2, r.content.split('\n').length))}
+          submitLabel="send edited"
+          onInput={value => act.draft(`${id}:edit`, value)}
+          onSubmit={value => act.reach(id, 'edit', value)}
+        />
+      )}
+      {Input && (
+        <Input
           key={`${id}-note`}
-          placeholder="What to change before it goes, Enter sends"
+          placeholder="Or tell Claude what to change, Enter sends"
           submitLabel="send"
           onInput={value => act.draft(id, value)}
           onSubmit={value => act.reach(id, 'change', value)}
@@ -415,6 +428,19 @@ export function cardView(els: ElementTable, card: HcpCard, act: Actions, ctx: Ca
     ) : null
 
   const hints = card.options.filter(o => card.picked.includes(o.value) && o.hint)
+
+  // A blind card shows Claude's recommendation only once the person has picked.
+  const recommendedLabels = card.options.filter(o => card.recommended?.includes(o.value)).map(o => o.label)
+  const blindLine =
+    card.kind === 'ask' && card.blind ? (
+      card.picked.length === 0 ? (
+        <Text dimColor>
+          {card.blind === 'stakes' ? 'Hard to undo or reaches others: ' : ''}pick first; Claude's recommendation shows after you choose.
+        </Text>
+      ) : (
+        <Text dimColor>Claude recommended: {recommendedLabels.join(', ') || 'nothing'}</Text>
+      )
+    ) : null
 
   const fix =
     card.kind === 'handoff' && card.fix ? (
@@ -485,6 +511,7 @@ export function cardView(els: ElementTable, card: HcpCard, act: Actions, ctx: Ca
       {card.audience && <Text dimColor>For: {card.audience}</Text>}
       {card.draft && <Markdown text={card.draft} />}
       {mediaBlock(els, card, act, ctx)}
+      {blindLine}
       {options}
       {hints.map(o => (
         <Text dimColor>
@@ -659,25 +686,46 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
                     shadow would {surface.verdict}: {clip(surface.reason, 90)}
                   </Text>
                 )}
-                {d.outcome === 'pending' ? (
-                  <Box flexDirection="row" gap={1} flexWrap="wrap">
-                    <Button key={`${d.id}-agree`} label="👍 Fine" onPress={() => act.agree(d.id)} />
-                    <Button key={`${d.id}-disagree`} label="✋ Disagree" onPress={() => act.disagree(d.id)} />
+                {d.outcome === 'pending' || d.outcome === 'agreed' ? (
+                  <Box flexDirection="column">
+                    <Box flexDirection="row" gap={1} flexWrap="wrap">
+                      {d.outcome === 'pending' ? (
+                        <Button key={`${d.id}-agree`} label="👍 Fine" onPress={() => act.agree(d.id)} />
+                      ) : (
+                        <Text dimColor>✓ you kept it</Text>
+                      )}
+                      <Button
+                        key={`${d.id}-disagree`}
+                        label={d.outcome === 'agreed' ? '✋ Disagree after all' : '✋ Disagree'}
+                        onPress={() => act.disagree(d.id)}
+                      />
+                      {Input && (
+                        <Input
+                          key={`${d.id}-why`}
+                          placeholder="Why not (optional), Enter disagrees"
+                          submitLabel="disagree"
+                          onInput={value => act.draft(d.id, value)}
+                          onSubmit={value => {
+                            act.draft(d.id, value)
+                            act.disagree(d.id)
+                          }}
+                        />
+                      )}
+                    </Box>
                     {Input && (
                       <Input
-                        key={`${d.id}-why`}
-                        placeholder="Why not (optional), Enter disagrees"
-                        submitLabel="disagree"
-                        onInput={value => act.draft(d.id, value)}
-                        onSubmit={value => {
-                          act.draft(d.id, value)
-                          act.disagree(d.id)
-                        }}
+                        key={`${d.id}-change`}
+                        placeholder={`Do this instead of ${clip(d.choice ?? 'it', 40)}, Enter sends`}
+                        submitLabel="change"
+                        onInput={value => act.draft(`${d.id}:change`, value)}
+                        onSubmit={value => act.change(d.id, value)}
                       />
                     )}
                   </Box>
                 ) : (
-                  <Text dimColor>{d.outcome === 'agreed' ? '✓ you kept it' : d.outcome === 'disagreed' ? '✋ you disagreed' : d.outcome}</Text>
+                  <Text dimColor>
+                    {d.outcome === 'disagreed' ? (d.change ? `✎ you changed it: ${clip(d.change, 80)}` : '✋ you disagreed') : d.outcome}
+                  </Text>
                 )}
               </Box>
             )

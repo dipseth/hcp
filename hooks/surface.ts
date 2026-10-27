@@ -28,7 +28,7 @@ export function surfacedRight(verdict: string | undefined, outcome: HcpDecision[
 /** A precedent as Jev reads it: what was decided, never how the person answered. */
 const brief = (d: HcpDecision) => ({ kind: d.kind, title: d.title, choice: d.choice, alternatives: d.alternatives })
 
-export const MAX_PRECEDENTS = 5
+export const MAX_PRECEDENTS = 10
 
 /**
  * The past decisions most like this one, resolved only: the same kind first,
@@ -72,8 +72,16 @@ export function surfaceFrame(decision: HcpDecision, precedents: readonly HcpDeci
 export type Evidence = {
   /** Precedents Jev judged the same kind of choice. */
   n: number
-  /** The person's record on them: (stood + 1) / (weighted + 2), this session counting double. */
+  /** The person's record on them, weighted: (stood + 1) / (stood + needed + 2). For display. */
   rate: number
+  /**
+   * A cautious reading of that record: the 5% lower bound of its Beta posterior.
+   * Few precedents give a low bound even when every one stood, so a kind earns
+   * tell or log only with enough evidence.
+   */
+  lower: number
+  /** The newest matched precedent went against Claude: ask again at once. */
+  lastNo: boolean
   reversible: number
   others: number
   close: number
@@ -82,20 +90,46 @@ export type Evidence = {
   matched: string[]
 }
 
+/**
+ * How much one answer counts. Trust falls faster than it rises: a Disagree
+ * outweighs three Fines, an override two. Unanswered and dismissed cards never
+ * get here (see similarPrecedents): silence is missing data, not agreement.
+ */
+export const OUTCOME_WEIGHT: Partial<Record<HcpDecision['outcome'], number>> = {
+  took: 1,
+  agreed: 1,
+  'no-pick': 1,
+  overrode: 2,
+  disagreed: 3,
+}
+
+/** The lower 5% bound of Beta(a, b), by its normal approximation: enough to gate on. */
+export function betaLower(a: number, b: number): number {
+  const n = a + b
+  const mean = a / n
+  const sd = Math.sqrt((a * b) / (n * n * (n + 1)))
+
+  return Math.max(0, Math.round((mean - 1.645 * sd) * 1000) / 1000)
+}
+
 /** Counting and weighting is code: Jev only said which precedents match. */
 export function evidenceOf(decision: HcpDecision, items: readonly HcpDecision[], p: Distributions, t: Record<string, number>): Evidence {
   const matched = items.filter((_, at) => (p[`same_kind_${at}`]?.[0] ?? 0) >= t.match!)
-  let weighted = 0
   let stood = 0
+  let needed = 0
   for (const d of matched) {
-    const w = d.session === decision.session ? 2 : 1
-    weighted += w
+    // This session's answers count double: the person's view today.
+    const w = (d.session === decision.session ? 2 : 1) * (OUTCOME_WEIGHT[d.outcome] ?? 0)
     if (STOOD.has(d.outcome)) stood += w
+    else if (NEEDED.has(d.outcome)) needed += w
   }
+  const newest = [...matched].sort((a, b) => b.at - a.at)[0]
 
   return {
     n: matched.length,
-    rate: Math.round(((stood + 1) / (weighted + 2)) * 1000) / 1000,
+    rate: Math.round(((stood + 1) / (stood + needed + 2)) * 1000) / 1000,
+    lower: betaLower(stood + 1, needed + 1),
+    lastNo: newest !== undefined && NEEDED.has(newest.outcome) && newest.outcome !== 'no-pick',
     // No judge answered: assume the worst, so the decision is asked.
     reversible: p.reversible?.[0] ?? 0,
     others: p.others?.[0] ?? 1,
@@ -103,6 +137,27 @@ export function evidenceOf(decision: HcpDecision, items: readonly HcpDecision[],
     explore: hashToUnit(`${decision.id}:explore`) < t.explore!,
     matched: matched.map(d => d.id),
   }
+}
+
+/**
+ * The floor under every surface pipeline, champion or challenger: a choice
+ * Claude marked hard to undo, or one that reaches other people, is always
+ * asked. It is code outside the specs, so no learned threshold can lower it.
+ */
+export function floorOf(decision: Pick<HcpDecision, 'reversible' | 'reach'>): string | undefined {
+  if (decision.reach === 'notifies') return 'it notifies people'
+  if (decision.reach === 'shared') return 'others can see it'
+  if (decision.reversible === false) return 'hard to undo'
+
+  return undefined
+}
+
+/** A pipeline's verdict with the floor applied: what it wanted is kept beside it. */
+export function withFloor<V extends { verdict: string; reason: string }>(decision: HcpDecision, v: V): V & { wanted?: string } {
+  const floor = floorOf(decision)
+  if (floor === undefined || v.verdict === 'ask') return v
+
+  return { ...v, verdict: 'ask', reason: `floor: ${floor}`, wanted: v.verdict }
 }
 
 /** The champion. Thresholds are a starting point: the shadow report is how they earn their values. */
@@ -123,29 +178,31 @@ export const SURFACE_SPEC = {
       call: 'hcp.evidence@1',
       args: { items: 'precedents.items', p: 'judge' },
       thresholds: { match: 0.7, explore: 0.1 },
-      version: '1',
+      version: '2',
     },
     gate: {
       kind: 'code',
       role: 'gate',
       inputs: { e: 'evidence' },
       branches: ['ask', 'tell', 'log'],
-      thresholds: { min_n: 3, others: 0.5, reversible: 0.5, tell: 0.75, log: 0.9, close: 0.5 },
+      // tell and log read the record's lower bound, not its mean: thin evidence stays asked.
+      thresholds: { min_n: 5, others: 0.5, reversible: 0.5, tell: 0.7, log: 0.85, close: 0.5 },
       rules: [
         { when: 'e.explore', branch: 'ask', reason: "'exploring: asked to keep the record honest'" },
         { when: 'e.n < $t.min_n', branch: 'ask', reason: "'too little precedent: ' & $string(e.n) & ' like it'" },
+        { when: 'e.lastNo', branch: 'ask', reason: "'you went another way on the last one like it'" },
         { when: 'e.others >= $t.others', branch: 'ask', reason: "'affects other people'" },
         { when: 'e.reversible < $t.reversible', branch: 'ask', reason: "'hard to undo'" },
         {
-          when: 'e.rate >= $t.log and e.close < $t.close',
+          when: 'e.lower >= $t.log and e.close < $t.close',
           branch: 'log',
-          reason: "'you kept the call ' & $string(e.rate * 100) & '% of the time on ' & $string(e.n) & ' like it'",
-          confidence: 'e.rate',
+          reason: "'you kept the call on ' & $string(e.n) & ' like it (at least ' & $string($round(e.lower * 100)) & '%)'",
+          confidence: 'e.lower',
         },
-        { when: 'e.rate >= $t.tell', branch: 'tell', reason: "'your record: ' & $string(e.rate * 100) & '% kept'", confidence: 'e.rate' },
-        { branch: 'ask', reason: "'you often chose differently: ' & $string(e.rate * 100) & '% kept'" },
+        { when: 'e.lower >= $t.tell', branch: 'tell', reason: "'your record: at least ' & $string($round(e.lower * 100)) & '% kept'", confidence: 'e.lower' },
+        { branch: 'ask', reason: "'not enough of a record yet: ' & $string($round(e.rate * 100)) & '% kept on ' & $string(e.n)" },
       ],
-      version: '1',
+      version: '2',
     },
     ask: { kind: 'code', role: 'derive', expr: '{ "verdict": "ask", "reason": $branches.gate.reason, "evidence": gate }', version: '1' },
     tell: { kind: 'code', role: 'derive', expr: '{ "verdict": "tell", "reason": $branches.gate.reason, "evidence": gate }', version: '1' },
@@ -187,7 +244,7 @@ export function hcpRegistry(pool: () => readonly HcpDecision[]): SpecRegistry {
       {
         id: 'hcp.precedents',
         version: '1',
-        describe: 'The past resolved decisions most like the input decision (same kind, repo, session first), at most 5, under `items`.',
+        describe: 'The past resolved decisions most like the input decision (same kind, repo, session first), at most 10, under `items`.',
         args: json,
         run: (_args: unknown, ctx: { input: unknown }) => ({ items: similarPrecedents(ctx.input as HcpDecision, pool()) }),
       },
@@ -195,7 +252,7 @@ export function hcpRegistry(pool: () => readonly HcpDecision[]): SpecRegistry {
         id: 'hcp.evidence',
         version: '1',
         describe:
-          "The person's record on the precedents Jev matched (`p.same_kind_<i>` ≥ threshold `match`): n, rate, reversible, others, close, explore.",
+          "The person's record on the precedents Jev matched (`p.same_kind_<i>` ≥ threshold `match`): n, rate (weighted mean), lower (its cautious 5% bound: gate on this), lastNo, reversible, others, close, explore.",
         args: z.object({ items: json, p: json }),
         run: (args: { items: unknown; p: unknown }, ctx: { input: unknown; thresholds: Readonly<Record<string, number>> }) =>
           evidenceOf(ctx.input as HcpDecision, (args.items ?? []) as HcpDecision[], (args.p ?? {}) as Distributions, ctx.thresholds),

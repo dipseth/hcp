@@ -83,6 +83,15 @@ export type HcpCard = {
   layout?: 'grid' | 'slides'
   /** The slide on show. */
   slide?: number
+  /**
+   * Ask: the recommendation, held back until the person picks. `stakes`: the
+   * choice is hard to undo or reaches others; `probe`: a sampled low-stakes card,
+   * so the ledger can compare picks with and without the default.
+   */
+  blind?: 'stakes' | 'probe'
+  recommended?: string[]
+  /** Reach: when Send was first pressed on a call that notifies people; a second press sends. */
+  armedAt?: number
   /** The person's note on a slide, by its index. */
   slideNotes?: Record<string, string>
 }
@@ -128,8 +137,12 @@ export type HcpOutward = {
   judgedBy?: string
 }
 
-/** Send on a reach card: this exact call may run once, until `expiresAt`. */
-export type HcpApproval = { callKey: string; cardId: string; expiresAt: number }
+/**
+ * Send on a reach card: this exact call may run once, until `expiresAt`. An
+ * edited send approves the person's text instead: a call on the same channel,
+ * to no one new, whose content is that text.
+ */
+export type HcpApproval = { callKey: string; cardId: string; expiresAt: number; content?: string; channel?: string; audience?: string[] }
 
 /**
  * A decision Claude made or asked about: the surface pipeline's input, and a
@@ -147,6 +160,10 @@ export type HcpDecision = {
   alternatives: string[]
   why?: string
   reversible?: boolean
+  /** Who the choice reaches, when Claude said: `shared` or `notifies` always asks, whatever the record says. */
+  reach?: ReachLevel
+  /** Asked with the recommendation hidden (see HcpCard.blind). */
+  blind?: 'stakes' | 'probe'
   /** The working directory's last segment. */
   repo?: string
   session: string
@@ -157,8 +174,17 @@ export type HcpDecision = {
    */
   outcome: 'pending' | 'took' | 'overrode' | 'no-pick' | 'dismissed' | 'agreed' | 'disagreed'
   picked?: string
-  /** What each surface pipeline would have done, by pipeline id: the champion and any challenger. */
-  shadow?: Record<string, { verdict: string; reason: string; runId?: string }>
+  /** Milliseconds from the card appearing to the person's answer: near-instant answers may be rubber stamps. */
+  answeredMs?: number
+  /** A Fine later turned into a Disagree: an error the first review let through. */
+  reversedFrom?: 'agreed'
+  /** The person's replacement for Claude's choice, from Change on a decided card. */
+  change?: string
+  /**
+   * What each surface pipeline would have done, by pipeline id: the champion and
+   * any challenger. `wanted`: the pipeline's own verdict when the floor overrode it.
+   */
+  shadow?: Record<string, { verdict: string; reason: string; runId?: string; wanted?: string }>
 }
 
 export type HcpMode = 'pairing' | 'heads-down' | 'away'

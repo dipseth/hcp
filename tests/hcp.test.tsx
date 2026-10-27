@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { callKey, classifyCall, gateOf, parseTags, redact } from '../hooks/reach'
-import { SURFACE_SPEC } from '../hooks/surface'
+import { SURFACE_SPEC, betaLower, evidenceOf, similarPrecedents, withFloor } from '../hooks/surface'
 import {
   detectService,
   markdownToHtml,
@@ -238,6 +238,8 @@ test('a grep that prints the login hint is not an auth failure', () => {
   expect(detectService('grep -rn "gcloud auth login" skills', '')).toBe(undefined)
   expect(detectService("bq query 'SELECT 1'", 'ERROR: Reauthentication failed. cannot prompt during non-interactive execution.')).toBe('gcloud')
   expect(detectService('ls', 'Error: not logged in')).toBe(undefined)
+  // A failed sed that printed hcp's own login table is not a login failure either.
+  expect(detectService('cd ~/x; sed -n 1,9p hooks/model.ts', "fix: 'gcloud auth login --update-adc'")).toBe(undefined)
 })
 
 test('later is five minutes in working hours and the next workday morning outside them', () => {
@@ -545,6 +547,10 @@ test('a comment is held with its exact content on a card, and Send lets the same
   expect(await ui.find({ type: 'Markdown', text: /Fixed in e53aa48, thanks @alice/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /held · card r1/ })).toBeDefined()
   await ui.press({ key: 'r1-send' })
+  // It notifies people: the first press says who and that it can't be unsent; nothing goes yet.
+  expect(await ui.find({ type: 'Text', text: /notifies dipseth\/hcp#12 and can't be unsent\. Press again/ })).toBeDefined()
+  expect(submitted.some(t => t.startsWith('[HCP r1]'))).toBe(false)
+  await ui.press({ key: 'r1-send' })
   expect(submitted[submitted.length - 1]).toBe('[HCP r1] Send it: make the held gh issue comment call again, unchanged.')
 
   expect((await $.tool.call({ tool: 'Bash', command: COMMENT })).deny).toBe(undefined)
@@ -623,6 +629,7 @@ test('Send and allow similar opens a grant that lets a like call through and hol
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await $.tool.call({ tool: 'Bash', command: COMMENT })
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'r1-similar-1h' })
   await ui.press({ key: 'r1-similar-1h' })
   expect(submitted[submitted.length - 1]).toContain('Similar gh issue comment calls to the same audience may go through for the next hour')
   await settle()
@@ -720,14 +727,16 @@ test('past answers on like decisions turn the shadow verdict to tell, and an ove
     type: 'decision',
     decision: { id, source: 'ask', kind: 'env-choice', title: 'Which environment?', choice: 'nprod', alternatives: ['nprod', 'prod'], session: 'old', at: 1, outcome: 'took' },
   })
-  files.set('/home/me/.claude/hcp/ledger/2026-10-20.jsonl', ['c1', 'c2', 'c3', 'c4'].map(id => JSON.stringify(before(id))).join('\n') + '\n')
+  // Ten kept calls: enough that even the record's cautious bound clears tell.
+  const ids = Array.from({ length: 10 }, (_, at) => `c${at + 1}`)
+  files.set('/home/me/.claude/hcp/ledger/2026-10-20.jsonl', ids.map(id => JSON.stringify(before(id))).join('\n') + '\n')
   const bodies = jevBy(on, key => (key.startsWith('same_kind') ? 0.92 : key === 'reversible' ? 0.9 : 0.1))
   await $.session.start({ cwd: '/work/hcp', surface: 'desktop', isInteractive: true })
 
   const card = { id: idOf(await $.tool.call(ENV_ASK)) }
   await settle()
   const asked = bodies.find(b => (b.questions as Record<string, unknown>).same_kind_0) as { state: { precedents: unknown[] } }
-  expect(asked.state.precedents.length).toBe(4)
+  expect(asked.state.precedents.length).toBe(10)
   expect(JSON.stringify(asked.state)).not.toContain('took') // Jev never sees how the person answered
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
@@ -771,7 +780,7 @@ test('a decision Claude records shows in the pane, and Disagree sends Claude bac
   await ui.input({ key: 'd1-why', text: 'we are moving to Temporal' })
   await settle()
   expect(submitted[submitted.length - 1]).toBe(
-    '[HCP d1] I disagree with "Which date library?" (you chose date-fns). we are moving to Temporal Stop and check with me before building on it.',
+    '[HCP d1] I disagree with "Which date library?" (you chose date-fns). we are moving to Temporal Undo what you did on the strength of it where you can, tell me what you reverted, and check with me before choosing again.',
   )
   expect(await ui.find({ type: 'Text', text: /you disagreed/ })).toBeDefined()
   await ui.unmount()
@@ -906,3 +915,119 @@ test(
     expect(batch?.auth).toBe('Basic cGstY2ZnOnNrLWVudg==') // base64("pk-cfg:sk-env")
   },
 )
+
+const past = (id: string, outcome: string, at = 1, session = 'old') =>
+  ({ id, source: 'ask', kind: 'env-choice', title: 'Which environment?', choice: 'nprod', alternatives: [], session, at, outcome }) as never
+
+test('the record promotes only on enough evidence, a Disagree outweighs a Fine, and silence is not agreement', () => {
+  const decision = past('c99', 'pending', 99, 'now') as { id: string; session: string }
+  const matchAll = (n: number) => Object.fromEntries(Array.from({ length: n }, (_, at) => [`same_kind_${at}`, [0.95]]))
+  const t = { match: 0.7, explore: 0 }
+  const evidence = (items: never[]) => evidenceOf(decision as never, items, matchAll(items.length), t)
+
+  // Three kept calls look like 80% kept, but the cautious bound stays low.
+  const three = evidence([past('a', 'took'), past('b', 'took'), past('c', 'took')])
+  expect(three.rate).toBe(0.8)
+  expect(three.lower).toBeLessThan(0.6)
+  const ten = evidence(Array.from({ length: 10 }, (_, at) => past(`k${at}`, 'took', at)))
+  expect(ten.lower).toBeGreaterThan(0.7)
+
+  // One Disagree among ten Fines pulls the record down as much as three Fines push it up.
+  const withNo = evidence([...Array.from({ length: 9 }, (_, at) => past(`k${at}`, 'agreed', at)), past('no', 'disagreed', 0)])
+  expect(withNo.rate).toBe(Math.round((10 / 14) * 1000) / 1000)
+  expect(withNo.lastNo).toBe(false)
+  // The newest going against Claude asks again at once.
+  expect(evidence([past('k1', 'took', 1), past('no', 'overrode', 5)]).lastNo).toBe(true)
+
+  // Unanswered and dismissed cards never become precedents.
+  const pool = [past('p', 'pending'), past('d', 'dismissed'), past('t', 'took')]
+  expect((similarPrecedents(decision as never, pool) as { id: string }[]).map(d => d.id)).toEqual(['t'])
+  expect(betaLower(1, 1)).toBeLessThan(0.1)
+})
+
+test('the floor turns any verdict back to ask for choices that reach people or are hard to undo', () => {
+  const tell = { verdict: 'tell', reason: 'your record: at least 80% kept' }
+  expect(withFloor({ reach: 'notifies' } as never, tell)).toEqual({ verdict: 'ask', reason: 'floor: it notifies people', wanted: 'tell' })
+  expect(withFloor({ reach: 'shared' } as never, { verdict: 'log', reason: 'x' })).toMatchObject({ verdict: 'ask', wanted: 'log' })
+  expect(withFloor({ reversible: false } as never, tell)).toMatchObject({ verdict: 'ask', reason: 'floor: hard to undo' })
+  expect(withFloor({ reach: 'own', reversible: true } as never, tell)).toEqual(tell)
+})
+
+test('a hard-to-undo ask hides the recommendation until the person picks, and the answer time is kept', async ($, on) => {
+  const submitted = engine(on, KEYED)
+  const files = ledger(on)
+  jevBy(on, () => 0.5)
+  await $.session.start({ cwd: '/work/hcp', surface: 'desktop', isInteractive: true })
+  const card = { id: idOf(await $.tool.call({ ...ENV_ASK, reversible: false } as never)) }
+  await settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /pick first; Claude's recommendation shows after you choose/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Claude recommended/ })).toBe(undefined)
+  await ui.press({ key: `${card.id}-opt-nprod` })
+  expect(await ui.find({ type: 'Text', text: /Claude recommended: nprod/ })).toBeDefined()
+  await submitted.clock.advance(12_000)
+  await ui.press({ key: `${card.id}-send` })
+  await settle()
+  await ui.unmount()
+
+  const rows = rowsOf(files)
+  const decided = rows.filter(r => r.type === 'decision').pop()!.decision as Record<string, unknown>
+  expect(decided).toMatchObject({ outcome: 'took', blind: 'stakes', reversible: false, answeredMs: 12_000 })
+  // Hard to undo: the floor keeps the shadow at ask.
+  expect(rows.find(r => r.type === 'shadow')).toMatchObject({ verdict: 'ask' })
+})
+
+test('a Fine can turn into a Disagree, Change replaces the choice, and the report counts what escaped', async ($, on) => {
+  const submitted = engine(on, KEYED)
+  ledger(on)
+  jevBy(on, () => 0.5)
+  await $.session.start({ cwd: '/work/hcp', surface: 'vscode', isInteractive: true })
+  const decide = (title: string, choice: string) =>
+    $.tool.call({ tool: 'mcp__hcp__decided', title, choice, kind: 'library' } as never)
+  await decide('Which date library?', 'date-fns')
+  await decide('Which test runner?', 'vitest')
+  await settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'vscode' })
+
+  await submitted.clock.advance(1000)
+  await ui.press({ key: 'd1-agree' })
+  await settle()
+  await ui.press({ key: 'd1-disagree' })
+  await settle()
+  expect(submitted[submitted.length - 1]).toMatch(/^\[HCP d1\] I disagree with "Which date library\?"/)
+
+  await ui.input({ key: 'd2-change', text: 'use bun test, it is already set up.' })
+  await settle()
+  expect(submitted[submitted.length - 1]).toBe(
+    '[HCP d2] Change "Which test runner?": instead of vitest, use bun test, it is already set up. Rework what you built on vitest to match, and say what changed.',
+  )
+  expect(await ui.find({ type: 'Text', text: /you changed it: use bun test/ })).toBeDefined()
+  await ui.unmount()
+
+  const report = (await $.command.run({ command: 'hcp', args: 'shadow', origin: { kind: 'composer' } } as never)).text ?? ''
+  expect(report).toContain('Attention (are answers judgments or rubber stamps?):')
+  expect(report).toContain('- library: 2 answered')
+  expect(report).toContain('Escaped: 1 of 1 Fines were later reversed.')
+})
+
+test('the person can edit a held message: the edited call goes through, the original does not', async ($, on) => {
+  const submitted = engine(on, KEYED)
+  const ran = tools(on)
+  jev(on, {})
+  ledger(on)
+  await $.session.start({ cwd: '/', surface: 'vscode', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: COMMENT })
+  const ui = await $.ui.mount({ ...PANE, surface: 'vscode' })
+  const edited = "gh issue comment 12 -R dipseth/hcp --body 'Fixed in e53aa48.'"
+
+  await ui.input({ key: 'r1-edit', text: edited })
+  await ui.input({ key: 'r1-edit', text: edited })
+  expect(submitted[submitted.length - 1]).toContain("[HCP r1] Send it with the person's edits")
+  expect(submitted[submitted.length - 1]).toContain(edited)
+
+  expect((await $.tool.call({ tool: 'Bash', command: COMMENT })).deny).toMatch(/Card r2/)
+  expect((await $.tool.call({ tool: 'Bash', command: edited })).deny).toBe(undefined)
+  expect(ran).toEqual([edited])
+  await ui.unmount()
+})

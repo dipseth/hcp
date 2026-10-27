@@ -4,7 +4,7 @@ Clickable seams between you and Claude, so a decision is a click instead of a pa
 
 **Claude posts cards** (tools `mcp__hcp__ask`, `mcp__hcp__handoff`, `mcp__hcp__share`). They draw inline at the tool row and in the HCP pane:
 
-- **ask**: options as buttons (single or multi), the recommendation preselected, an optional draft to approve, and a note field.
+- **ask**: options as buttons (single or multi), the recommendation preselected, an optional draft to approve, and a note field. A choice Claude marks `reversible: false` or `reach: shared|notifies` hides the recommendation until you pick, and so does a random 5% of low-stakes cards (see Decisions as evidence).
 - **handoff**: a step only you can do. An expired gcloud/bq login in any Bash call raises one automatically, and Claude is told to stop retrying. **Run it** opens the browser login and then verifies with a bq dry run. **Put in prompt** fills `! <command>`. An MCP server that needs authorizing raises one too, the first time Claude searches for its tools; the pane also shows a 🔑 line while the engine lists any server as needing auth.
 - **share**: text for somewhere else. **Copy formatted** puts HTML and plain text on the clipboard together, so bold, lists and links survive the paste into Slack, mail or a doc; **Copy plain** is text alone. A note asks Claude for a change.
 
@@ -46,11 +46,12 @@ Scheduled messages live as long as the session: closing it drops them.
 Every tool call is sorted by who it reaches: **local** (this machine), **own** (your accounts, nobody told), **shared** (others can see it), **notifies** (a person gets a message).
 
 - **notifies** calls are held. The call fails for Claude with "[hcp] Held … card r<n>", and a reach card shows the exact content and who it goes to. You can answer:
-  - **Send**: Claude makes the same call again. That exact call runs once, and Claude Code doesn't ask permission a second time.
+  - **Send**: Claude makes the same call again. That exact call runs once, and Claude Code doesn't ask permission a second time. A message can't be unsent, so the first press says who gets it and the second press sends.
   - **Send · allow similar 1h** or **… for today**: also opens a grant.
   - **Save as draft**.
   - **Not now**.
-  - Or type a change.
+  - **Edit** the content in place and press Enter (twice, as with Send): Claude makes the call with your text, and it runs without another card if the content matches.
+  - Or tell Claude what to change.
 - **shared** calls run with a badge on the tool row, for example `↗ git push · origin main · others can see`. **local** and **own** calls run untouched.
 - **A grant** lets later calls through without a card, until it expires. A call qualifies only when it uses the same channel (`gh issue comment`), reaches nobody outside the grant's audience, and the judge finds it the same kind of message with no new sensitive material. Anything less gets a card. The pane lists grants with a countdown and **Revoke**, and lists everything outward this session.
 - **Claude reads the contract first.** The protocol and the descriptions of tools that notify people say so, so Claude makes the call and lets hcp ask, instead of asking twice.
@@ -74,12 +75,14 @@ The sample is small, so treat the thresholds as a start and re-run `node build/c
 
 Which choices should reach you at all? Today Claude decides that from prose. hcp is turning it into evidence, starting in shadow:
 
-- **Every decision gets a record.** An ask card, given a `kind` (`env-choice`, `library`), is one. So is a choice Claude makes itself and records with `mcp__hcp__decided`; the pane lists those under **Claude decided** with **👍 Fine** and **✋ Disagree**. Disagreeing sends Claude back to check with you.
-- **The surface pipeline** (`hooks/surface.ts`, a JSON spec) runs on each record. It reads the most similar past decisions, from this session and from the ledger's last 30 days. Jev answers which of them really are the same kind of choice, plus three facts about this one: reversible? affects others? are the options close? Code counts your record on the matching ones, giving this session double weight: (kept + 1) / (counted + 2). A gate then picks one of:
+- **Every decision gets a record.** An ask card, given a `kind` (`env-choice`, `library`), is one. So is a choice Claude makes itself and records with `mcp__hcp__decided`; the pane lists those under **Claude decided** with **👍 Fine**, **✋ Disagree** and a **Change** field. Disagree tells Claude to undo what it did on the strength of the choice and check with you. Change gives Claude your replacement and has it rework what was built on the old choice. A Fine can still become **Disagree after all**, which the record counts as an error the first review missed.
+- **The surface pipeline** (`hooks/surface.ts`, a JSON spec) runs on each record. It reads the most similar past decisions, from this session and from the ledger's last 30 days. Jev answers which of them really are the same kind of choice, plus three facts about this one: reversible? affects others? are the options close? Code counts your record on the matching ones, at most 10, giving this session double weight. A Disagree counts as much as three Fines, and an override as much as two, because trust falls faster than it rises. Unanswered and dismissed cards are missing data, not agreement, and never count. The gate reads the record's cautious lower bound (the 5% bound of its Beta posterior), not its average, so a kind earns tell or log only with enough evidence: about 10 kept calls in a row for tell. A gate then picks one of:
   - **ask**: a card before Claude acts;
   - **tell**: Claude acts, and you get a card to override;
   - **log**: recorded only.
-- **New ideas get a way in.** With fewer than 3 precedents, the verdict is ask. A fixed 10% of decisions are asked anyway, chosen deterministically, so the record keeps learning. Anything that affects others or is hard to undo is always asked.
+- **New ideas get a way in.** With fewer than 5 precedents, the verdict is ask, and so it is when you went another way on the newest one like it. A fixed 10% of decisions are asked anyway, chosen deterministically, so the record keeps learning.
+- **A floor no pipeline can lower.** A decision Claude marks `reversible: false` or `reach: shared|notifies` is asked whatever the champion or any challenger says. The floor is code outside the specs (`floorOf` in `hooks/surface.ts`), and the shadow record keeps what the pipeline wanted beside it.
+- **Watching for rubber stamps.** Every answer records how long it took. `/hcp shadow` lists per kind: answers, median time, the share under 3 seconds, how often you kept Claude's call, and how many Fines were later reversed. It flags a kind where almost every answer is fast and agrees. The random 5% of ask cards with the recommendation hidden measure how much preselection sways you: the report compares how often you match Claude with and without it.
 - **It changes nothing yet.** The verdict is recorded beside what you actually did, and your answer scores it: was asking needed? `/hcp shadow` shows how often it would have been right, how many cards it would have saved, and how often it would have skipped asking when you wanted a say. It earns control only through a pre-registered trial.
 
 ## Pipelines Claude writes

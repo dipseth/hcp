@@ -11,8 +11,10 @@ import { bindSession, loadHistory, pipelineTool, resolved, shadow, shadowReport 
 import { useOptions } from './langfuse'
 import { existing, expandAll, pastedImages, prepare, saveBytes, thumbnails } from './media'
 import { appendLedger, generatePort, initObservability, reachPorts, scoresPort } from './ports'
+import { floorOf } from './surface'
 import type { Judged } from './ports'
 import { callKey, classifyCall, reachPipeline } from './reach'
+import { hashToUnit } from './vendor/dp.js'
 import type { CallFacts, ReachVerdict } from './reach'
 import { runPipeline, submitFeedback } from './vendor/dp.js'
 import type { RunRecord } from './vendor/dp.js'
@@ -101,24 +103,40 @@ async function recordDecision($: Engine, fields: Omit<HcpDecision, 'session' | '
   return decision
 }
 
-/** The person's answer settles a decision: kept in the ledger as a precedent, and fed back to each shadow run. */
-async function resolveDecision($: Engine, id: string, outcome: HcpDecision['outcome'], picked?: string) {
+type Resolution = Pick<HcpDecision, 'picked' | 'answeredMs' | 'change'>
+
+/**
+ * The person's answer settles a decision: kept in the ledger as a precedent,
+ * and fed back to each shadow run. A Disagree after a Fine re-opens it: that
+ * Fine let an error through, and the record says so.
+ */
+async function resolveDecision($: Engine, id: string, outcome: HcpDecision['outcome'], extra: Resolution = {}) {
   await shadowing.get(id)
   let done: HcpDecision | undefined
+  const fields = Object.fromEntries(Object.entries(extra).filter(([, v]) => v !== undefined)) as Resolution
   await saveDecisions($, list =>
-    list.map(d => (d.id === id && d.outcome === 'pending' ? (done = { ...d, outcome, ...(picked ? { picked } : {}) }) : d)),
+    list.map(d => {
+      if (d.id !== id) return d
+      if (d.outcome === 'pending') return (done = { ...d, outcome, ...fields })
+      if (d.outcome === 'agreed' && outcome === 'disagreed') return (done = { ...d, outcome, reversedFrom: 'agreed', ...fields, answeredMs: d.answeredMs })
+
+      return d
+    }),
   )
   if (done) await resolved($, done)
 }
 
-/** How an ask card's answer reads as a decision outcome. */
+/** How an ask card's answer reads as a decision outcome, and how long the person took. */
 async function resolveAsk($: Engine, card: HcpCard) {
   const decision = liveDecisions.find(d => d.id === card.id)
   if (!decision) return
   const labels = card.options.filter(o => card.picked.includes(o.value)).map(o => o.label)
   const outcome = labels.length === 0 ? 'no-pick' : decision.choice !== undefined && labels.includes(decision.choice) ? 'took' : 'overrode'
-  await resolveDecision($, card.id, outcome, labels.join(', ') || undefined)
+  await resolveDecision($, card.id, outcome, { picked: labels.join(', ') || undefined, answeredMs: (await $.clock.now()) - card.createdAt })
 }
+
+/** A share of low-stakes ask cards hide the recommendation, so the ledger can measure how much preselection sways picks. */
+export const PROBE_RATE = 0.05
 
 // UTC offset in minutes, from `date +%z`; the hooks environment's own zone may differ.
 let offset = -new Date().getTimezoneOffset()
@@ -487,19 +505,30 @@ async function verifyThenAnswer($: Engine, id: string) {
 }
 
 const APPROVAL_MS = 30 * 60_000
+// How long the first Send press on a notifying call stays armed.
+const ARM_MS = 15_000
 
 async function noteOutward($: Engine, row: HcpOutward) {
   await update($, outward, list => [...list.filter(o => o.toolUseId !== row.toolUseId), row].slice(-50))
 }
 
-/** The exact call's one-time approval, taken: it runs once. */
-async function takeApproval($: Engine, key: string): Promise<HcpApproval | undefined> {
+const sameText = (a: string, b: string) => a.replace(/\s+/g, ' ').trim() === b.replace(/\s+/g, ' ').trim()
+
+/** The person's edited text approves a call on that channel, to no one new, carrying exactly that text. */
+const fitsEdit = (a: HcpApproval, facts: CallFacts) =>
+  a.content !== undefined &&
+  a.channel === facts.channel &&
+  facts.audience.every(who => (a.audience ?? []).includes(who)) &&
+  sameText(a.content, facts.content)
+
+/** The call's one-time approval, exact or by edited text, taken: it runs once. */
+async function takeApproval($: Engine, key: string, facts: CallFacts): Promise<HcpApproval | undefined> {
   const at = await $.clock.now()
   let taken: HcpApproval | undefined
   await update($, approvals, list =>
     list.filter(a => {
       if (a.expiresAt <= at) return false
-      if (taken === undefined && a.callKey === key) {
+      if (taken === undefined && (a.callKey === key || fitsEdit(a, facts))) {
         taken = a
 
         return false
@@ -534,7 +563,7 @@ async function guard($: Engine, e: { tool: string; tool_use_id: string; agentId?
   const key = callKey(e.tool, input)
   const row = { toolUseId: e.tool_use_id, at, tool: e.tool, channel: facts.channel, audience: facts.audience }
 
-  const approval = await takeApproval($, key)
+  const approval = await takeApproval($, key, facts)
   if (approval !== undefined) {
     passes.set(e.tool_use_id, `approved on hcp card ${approval.cardId}`)
     await noteOutward($, { ...row, level: facts.level ?? 'notifies', verdict: 'approved', why: `sent from card ${approval.cardId}`, cardId: approval.cardId })
@@ -614,23 +643,40 @@ async function guard($: Engine, e: { tool: string; tool_use_id: string; agentId?
 }
 
 /** Send, allow similar, change, save as draft, or not now: the person's answer to a held call. */
-async function answerReach($: Engine, id: string, choice: ReachChoice, typed?: string) {
+async function answerReach($: Engine, id: string, pressed: ReachChoice, typed?: string) {
+  let choice = pressed
   if (busy.has(id)) return
   busy.add(id)
   try {
     const card = await findCard($, id)
     const r = card?.reach
     if (!card || !r || card.status !== 'open') return
-    const note = (typed ?? drafts.get(id) ?? '').trim()
-    if (choice === 'change' && !note) {
-      $.ui.toast('Type the change first, then press Enter.')
+    const note = (typed ?? drafts.get(choice === 'edit' ? `${id}:edit` : id) ?? '').trim()
+    if ((choice === 'change' || choice === 'edit') && !note) {
+      $.ui.toast(choice === 'edit' ? 'The text is empty: edit it, then press Enter.' : 'Type the change first, then press Enter.')
 
       return
     }
     const at = await $.clock.now()
     const hours = GRANT_HOURS[choice]
+    // A call that notifies people can't be unsent: the first press shows who gets it, the second sends.
+    if ((choice === 'send' || choice === 'edit' || hours !== undefined) && r.level === 'notifies') {
+      if (card.armedAt === undefined || at - card.armedAt > ARM_MS) {
+        const who = r.audience.length > 0 ? clip(r.audience.join(', '), 80) : 'its audience'
+        await patchCard($, id, c => ({ ...c, armedAt: at, progress: `This notifies ${who} and can't be unsent. Press again to send.` }))
+
+        return
+      }
+    }
+    if (choice === 'edit' && sameText(note, r.content)) choice = 'send'
     if (choice === 'send' || hours !== undefined) {
       await update($, approvals, list => [...list.filter(a => a.expiresAt > at), { callKey: r.callKey, cardId: id, expiresAt: at + APPROVAL_MS }])
+    }
+    if (choice === 'edit') {
+      await update($, approvals, list => [
+        ...list.filter(a => a.expiresAt > at),
+        { callKey: '', cardId: id, expiresAt: at + APPROVAL_MS, content: note, channel: r.channel, audience: r.audience },
+      ])
     }
     if (hours !== undefined) {
       const grant: HcpGrant = {
@@ -657,6 +703,7 @@ async function answerReach($: Engine, id: string, choice: ReachChoice, typed?: s
     }
     const text = reachAnswerText(card, choice, note)
     drafts.delete(id)
+    drafts.delete(`${id}:edit`)
     const delivery = choice === 'not-now' ? 'nntr' : 'now'
     if (delivery === 'now') {
       const wasQueued = isTurnRunning
@@ -699,18 +746,42 @@ function actionsFor($: Engine): Actions {
         .then(() => refreshStatus($))
         .then(() => resolveDecision($, id, 'dismissed')),
     agree: id =>
-      void resolveDecision($, id, 'agreed').then(() => $.ui.toast('Noted: choices like this need less asking.')),
-    disagree: id =>
       void (async () => {
         const decision = liveDecisions.find(d => d.id === id)
         if (!decision || decision.outcome !== 'pending') return
+        await resolveDecision($, id, 'agreed', { answeredMs: (await $.clock.now()) - decision.at })
+        $.ui.toast('Noted. You can still disagree later.')
+      })(),
+    disagree: id =>
+      void (async () => {
+        const decision = liveDecisions.find(d => d.id === id)
+        if (!decision || (decision.outcome !== 'pending' && decision.outcome !== 'agreed')) return
         const note = (drafts.get(id) ?? '').trim()
         drafts.delete(id)
-        await resolveDecision($, id, 'disagreed')
+        await resolveDecision($, id, 'disagreed', { answeredMs: (await $.clock.now()) - decision.at })
         $.ui.toast(sentToast(isTurnRunning))
         await deliver(
           $,
-          `[HCP ${id}] I disagree with "${decision.title}" (you chose ${decision.choice}).${note ? ` ${note}` : ''} Stop and check with me before building on it.`,
+          `[HCP ${id}] I disagree with "${decision.title}" (you chose ${decision.choice}).${note ? ` ${note}` : ''} Undo what you did on the strength of it where you can, tell me what you reverted, and check with me before choosing again.`,
+          'now',
+        )
+      })(),
+    change: (id, typed) =>
+      void (async () => {
+        const decision = liveDecisions.find(d => d.id === id)
+        const text = (typed ?? drafts.get(`${id}:change`) ?? '').trim()
+        if (!decision || (decision.outcome !== 'pending' && decision.outcome !== 'agreed')) return
+        if (!text) {
+          $.ui.toast('Type what to do instead, then press Enter.')
+
+          return
+        }
+        drafts.delete(`${id}:change`)
+        await resolveDecision($, id, 'disagreed', { change: text, answeredMs: (await $.clock.now()) - decision.at })
+        $.ui.toast(sentToast(isTurnRunning))
+        await deliver(
+          $,
+          `[HCP ${id}] Change "${decision.title}": instead of ${decision.choice}, ${text} Rework what you built on ${decision.choice} to match, and say what changed.`,
           'now',
         )
       })(),
@@ -1083,6 +1154,18 @@ export const register: Register = (on, options) => {
         ? [input.recommended]
         : []
     const picked = options.map(o => o.value).filter(v => wanted.includes(v))
+    const reach = ['local', 'own', 'shared', 'notifies'].includes(input.reach as string) ? (input.reach as HcpDecision['reach']) : undefined
+    const reversible = typeof input.reversible === 'boolean' ? input.reversible : undefined
+    const n = (await read($, seq)) + 1
+    // A choice that can't be undone or reaches others is picked before the recommendation shows.
+    const blind: HcpCard['blind'] =
+      picked.length === 0
+        ? undefined
+        : floorOf({ reach, reversible }) !== undefined
+          ? 'stakes'
+          : !isMulti && hashToUnit(`${sessionId}:c${n}:probe`) < PROBE_RATE
+            ? 'probe'
+            : undefined
     const pictures = await mediaFields($, input)
     const card = await postCard($, {
       ...blank,
@@ -1094,10 +1177,11 @@ export const register: Register = (on, options) => {
       ...(typeof input.draft === 'string' ? { draft: input.draft } : {}),
       options,
       isMulti,
-      picked: isMulti ? picked : picked.slice(0, 1),
+      picked: blind ? [] : isMulti ? picked : picked.slice(0, 1),
+      ...(blind ? { blind, recommended: isMulti ? picked : picked.slice(0, 1) } : {}),
       ...pictures.fields,
     })
-    const recommended = options.find(o => card.picked.includes(o.value))
+    const recommended = options.find(o => (card.recommended ?? card.picked).includes(o.value))
     await recordDecision($, {
       id: card.id,
       source: 'ask',
@@ -1105,6 +1189,9 @@ export const register: Register = (on, options) => {
       title: card.title,
       ...(recommended ? { choice: recommended.label } : {}),
       alternatives: options.map(o => o.label),
+      ...(reach ? { reach } : {}),
+      ...(reversible !== undefined ? { reversible } : {}),
+      ...(blind ? { blind } : {}),
     })
 
     return { result: postedText(card) + pictures.note }
@@ -1125,6 +1212,7 @@ export const register: Register = (on, options) => {
       alternatives: Array.isArray(input.alternatives) ? input.alternatives.filter((a): a is string => typeof a === 'string') : [],
       ...(typeof input.why === 'string' ? { why: input.why } : {}),
       ...(typeof input.reversible === 'boolean' ? { reversible: input.reversible } : {}),
+      ...(['local', 'own', 'shared', 'notifies'].includes(input.reach as string) ? { reach: input.reach as HcpDecision['reach'] } : {}),
     })
 
     return { result: `Recorded ${decision.id}. Carry on; the person can disagree from the pane ("[HCP ${decision.id}] I disagree …").` }

@@ -16,7 +16,7 @@ const protocolRules = (watched: string) => [
   '- Text the person will paste elsewhere (a Slack message, an email, a PR description, a status update): call mcp__hcp__share instead of printing it for them to select. It is outward-facing: write it for its audience.',
   `- A step only they can do (an interactive login, VPN, an access request, /mcp auth, running something locally): call mcp__hcp__handoff. Auth failures from ${watched} in Bash, and MCP servers that need authorizing, are raised as handoffs for you, and you'll get a note saying so: don't retry the command, debug it, or run the login yourself.`,
   '- Calls that reach other people (an email, a chat message, an issue or PR comment, an @mention) are held by hcp until the person approves the exact content on a card: the call fails with "[hcp] Held … card r<n>". Don\'t ask first and don\'t retry or work around a held call; carry on or end your turn. "[HCP r<n>] Send" means make the same call again, unchanged. Public pushes and shared docs only get a badge.',
-  '- When you make a non-trivial choice yourself (an approach, a library, a scope cut, a default that matters), record it with mcp__hcp__decided in one call and carry on. Give every mcp__hcp__ask a `kind` too. hcp learns from how the person answers like decisions, and shows yours in the pane where they can disagree.',
+  '- When you make a non-trivial choice yourself (an approach, a library, a scope cut, a default that matters), record it with mcp__hcp__decided in one call and carry on. Give every mcp__hcp__ask a `kind` too, and `reversible: false` or `reach` when the choice is hard to undo or reaches others. hcp learns from how the person answers like decisions, and shows yours in the pane where they can disagree or change them. "[HCP d<n>] Change …" means rework what you built on that choice to match.',
   '- To give a decision in the task a decision pipeline (a model estimates, code decides, the person corrects it later), or to propose a better way for hcp to choose what to ask, use mcp__hcp__pipeline: `describe` first, then `define`, then `run`.',
   "- Cards don't block. Keep going on work that doesn't need the answer, or end your turn with one short line.",
   '- Pictures belong on the card: pass screenshots, renders or charts the person should look at in `media` (absolute paths, a one-line `caption` each; a video is sampled into frames) on any of the three tools, instead of describing them in prose.',
@@ -102,6 +102,12 @@ export const ASK_TOOL = {
         items: { type: 'string' },
         description: 'Values to preselect: your recommendation.',
       },
+      reversible: { type: 'boolean', description: 'false when the choice is hard to undo: hcp then shows your recommendation only after the person picks.' },
+      reach: {
+        type: 'string',
+        enum: ['local', 'own', 'shared', 'notifies'],
+        description: 'Who acting on the choice reaches: shared (others see it) or notifies (people get a message) is always asked, and hides your recommendation until the person picks.',
+      },
       ...MEDIA_PROPS,
     },
     required: ['title', 'options'],
@@ -156,6 +162,11 @@ export const DECIDED_TOOL = {
       why: { type: 'string', description: 'One line.' },
       kind: { type: 'string', description: 'A short slug for the sort of choice: library, scope, naming, approach.' },
       reversible: { type: 'boolean', description: 'Whether it is cheap to undo later.' },
+      reach: {
+        type: 'string',
+        enum: ['local', 'own', 'shared', 'notifies'],
+        description: 'Who the choice reaches: shared or notifies means it should have been an mcp__hcp__ask instead.',
+      },
     },
     required: ['title', 'choice', 'kind'],
   } satisfies Schema,
@@ -378,7 +389,12 @@ export function watchedLabels(): string {
  * stderr for a call that succeeded and the whole output for one that failed,
  * so a grep that prints "gcloud auth login" never counts.
  */
+// Commands that only print files: their output can quote a login hint without any login failing.
+const VIEWER = /^\s*(cd\s+[^;&|]+(&&|;)\s*)?(cat|sed|grep|rg|head|tail|less|awk|wc|find|ls|jq|git\s+(show|diff|log|grep))\b/
+
 export function detectService(command: string, scanned: string): string | undefined {
+  if (VIEWER.test(command)) return undefined
+
   return Object.keys(current.services).find(name => {
     const service = current.services[name]!
 
@@ -454,7 +470,7 @@ export function heldText(card: HcpCard, mode: HcpMode): string {
 }
 
 /** The person's choice on a reach card. */
-export type ReachChoice = 'send' | 'similar-1h' | 'similar-day' | 'change' | 'draft' | 'not-now'
+export type ReachChoice = 'send' | 'similar-1h' | 'similar-day' | 'change' | 'edit' | 'draft' | 'not-now'
 
 export const GRANT_HOURS: Partial<Record<ReachChoice, number>> = { 'similar-1h': 1, 'similar-day': 10 }
 
@@ -473,6 +489,11 @@ export function reachAnswerText(card: HcpCard, choice: ReachChoice, note: string
   }
   if (choice === 'change') {
     return `[HCP ${card.id}] Don't send the ${r.channel} call as it is. Change it:${said || ' see the note.'} Then make the call again; hcp shows it to the person once more.`
+  }
+  if (choice === 'edit') {
+    const fence = note.includes('```') ? '~~~' : '```'
+
+    return `[HCP ${card.id}] Send it with the person's edits: make the ${r.channel} call again to the same audience, with exactly this as its content (for a Bash call, this is the whole command):\n${fence}\n${note.trim()}\n${fence}\nIt goes through without another card if the content matches.`
   }
   if (choice === 'draft') {
     return `[HCP ${card.id}] Don't send the ${r.channel} call. Save it as a draft instead (a draft in that service if it has one, else an mcp__hcp__share card with the text).${said}`

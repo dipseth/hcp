@@ -9,7 +9,7 @@ import type { EngineInterface } from 'claude-code'
 import type { HcpDecision } from '../types'
 import { appendJsonl, appendLedger, decidePort, generatePort, ROUTES, scoresPort, tracerFor } from './ports'
 import type { Frame, Judge, Judged, Route } from './ports'
-import { SURFACE_SPEC, compileSpec, hcpRegistry, surfaceFrame, surfacedRight } from './surface'
+import { SURFACE_SPEC, compileSpec, hcpRegistry, surfaceFrame, surfacedRight, withFloor } from './surface'
 import { describeRegistry, renderPipelineSvg, runPipeline, submitFeedback } from './vendor/dp.js'
 import type { JevQuestion, Pipeline, PipelinePorts, RunRecord } from './vendor/dp.js'
 
@@ -121,8 +121,8 @@ export async function shadow($: Engine, decision: HcpDecision, judge: Judge): Pr
     try {
       const ran = await runPipeline(pipeline, decision, specPorts($, judge, judged, { questions, routes: {}, spec: { id } }, r => void (record = r)))
       const verdict = ran.output as { verdict?: string; reason?: string }
-      // No tracer, no run id: the run key names the run for its feedback.
-      out[id] = { verdict: verdict.verdict ?? ran.route, reason: verdict.reason ?? '', runId: ran.runId ?? ran.runKey }
+      // No tracer, no run id: the run key names the run for its feedback. The floor has the last word.
+      out[id] = withFloor(decision, { verdict: verdict.verdict ?? ran.route, reason: verdict.reason ?? '', runId: ran.runId ?? ran.runKey })
       void appendLedger($, { type: 'shadow', decisionId: decision.id, session: decision.session, pipeline: id, ...out[id], judgedBy: judged.by, record })
     } catch (error) {
       void appendLedger($, { type: 'shadow-failed', decisionId: decision.id, pipeline: id, error: String((error as Error).message).slice(0, 200) })
@@ -148,9 +148,9 @@ export async function resolved($: Engine, decision: HcpDecision) {
   }
 }
 
-/** How each surface pipeline would have done against what the person really did. */
+/** How each surface pipeline would have done against what the person really did, and how much attention the answers carried. */
 export function shadowReport(decisions: readonly HcpDecision[]): string {
-  const all = [...history, ...decisions]
+  const all = latest([...history, ...decisions])
   const ids = new Set(all.flatMap(d => Object.keys(d.shadow ?? {})))
   if (ids.size === 0) return 'No decisions recorded yet: give mcp__hcp__ask a `kind`, or record choices with mcp__hcp__decided.'
   const lines = [`${all.length} decisions recorded (${decisions.length} this session).`]
@@ -161,9 +161,11 @@ export function shadowReport(decisions: readonly HcpDecision[]): string {
     let judged = 0
     let cardsSaved = 0
     let wrongSilence = 0
+    let floored = 0
     for (const d of runs) {
       const s = d.shadow![id]!
       counts[s.verdict] = (counts[s.verdict] ?? 0) + 1
+      if (s.wanted) floored++
       const ok = surfacedRight(s.verdict, d.outcome)
       if (ok === undefined) continue
       judged++
@@ -173,20 +175,80 @@ export function shadowReport(decisions: readonly HcpDecision[]): string {
     }
     lines.push(
       `${id === 'hcp-surface' ? 'champion' : 'challenger'} ${id}: would ask ${counts.ask ?? 0}, tell ${counts.tell ?? 0}, log ${counts.log ?? 0}.` +
+        (floored > 0 ? ` The floor turned ${floored} back to ask.` : '') +
         (judged > 0
           ? ` Right on ${right}/${judged} the person resolved; ${cardsSaved} cards it would have saved, ${wrongSilence} times it would have skipped asking when the person wanted a say.`
           : ' None resolved yet.'),
     )
   }
+  lines.push(...attentionReport(all))
 
   return lines.join('\n')
+}
+
+/** The newest record of each decision: a Fine turned Disagree is written twice. */
+function latest(list: readonly HcpDecision[]): HcpDecision[] {
+  const byId = new Map<string, HcpDecision>()
+  for (const d of list) byId.set(`${d.session}:${d.id}`, d)
+
+  return [...byId.values()]
+}
+
+/** An answer this fast is unlikely to be a read: a possible rubber stamp. */
+export const FAST_MS = 3000
+
+const median = (xs: number[]) => {
+  const sorted = [...xs].sort((a, b) => a - b)
+
+  return sorted.length === 0 ? 0 : sorted[Math.floor(sorted.length / 2)]!
+}
+
+const pct = (part: number, whole: number) => `${Math.round((part / Math.max(1, whole)) * 100)}%`
+
+/**
+ * Whether answers carry judgment: per kind, how fast they came, how often a
+ * Fine was later reversed, and whether the person matches Claude as often when
+ * the recommendation is hidden as when it is preselected.
+ */
+export function attentionReport(all: readonly HcpDecision[]): string[] {
+  const answered = all.filter(d => d.answeredMs !== undefined)
+  if (answered.length === 0) return []
+  const lines = ['Attention (are answers judgments or rubber stamps?):']
+  const kinds = [...new Set(answered.map(d => d.kind))]
+  for (const kind of kinds) {
+    const rows = answered.filter(d => d.kind === kind)
+    const ms = rows.map(d => d.answeredMs!)
+    const fast = ms.filter(m => m < FAST_MS).length
+    const kept = rows.filter(d => d.outcome === 'took' || d.outcome === 'agreed').length
+    const escaped = rows.filter(d => d.reversedFrom).length
+    const flag = rows.length >= 5 && fast / rows.length >= 0.8 && kept / rows.length >= 0.9 ? ' ⚠ looks like rubber-stamping' : ''
+    lines.push(
+      `- ${kind}: ${rows.length} answered, median ${(median(ms) / 1000).toFixed(1)}s, ${pct(fast, rows.length)} under ${FAST_MS / 1000}s, ${pct(kept, rows.length)} kept Claude's call` +
+        (escaped > 0 ? `, ${escaped} Fine later reversed` : '') +
+        flag,
+    )
+  }
+  const asks = answered.filter(d => d.source === 'ask' && d.choice !== undefined)
+  const shown = asks.filter(d => !d.blind)
+  const blind = asks.filter(d => d.blind === 'probe')
+  if (blind.length > 0) {
+    const took = (xs: HcpDecision[]) => xs.filter(d => d.outcome === 'took').length
+    lines.push(
+      `Default effect: matched Claude ${pct(took(shown), shown.length)} with the recommendation preselected (${shown.length}), ${pct(took(blind), blind.length)} with it hidden (${blind.length} probes).`,
+    )
+  }
+  const escaped = all.filter(d => d.reversedFrom).length
+  const fine = all.filter(d => d.outcome === 'agreed' || d.reversedFrom).length
+  if (fine > 0) lines.push(`Escaped: ${escaped} of ${fine} Fines were later reversed.`)
+
+  return lines
 }
 
 const PIPELINE_GUIDE = `Write a decision pipeline as a JSON spec: models estimate, code decides, a person corrects it later.
 Contract: one \`fact\` and \`result\`; at least one code node with role "gate" (branches + thresholds + rules in JSONata, the last rule with no \`when\`); an edge out of the gate for every branch; at least one \`feedback\` edge landing on an earlier node (form "score" with a score config); \`eval\` { dataset, gateMetric: "score_positive" }; an acyclic graph.
 Nodes: read (call a registry primitive), decide (\`questions\`: a set name you supply in \`questions\`, each yes/no as { "type": "noul", "instructions": "... \`input.x\` ..." }: atomic facts, point at state paths with backticks; the state Jev sees is { input, from: upstream outputs }), generate (\`route\`: a route you supply in \`routes\` { model: "haiku"|"sonnet", version, system, maxTokens }), code (transform/derive/validate with \`expr\` in JSONata, or gate with \`rules\`), store (writes to ~/.claude/hcp/facts/<id>.jsonl).
 Inputs and outputs name the schema "json". Count, compare and do arithmetic in code, never in a question.
-scope "internal": a challenger to how hcp surfaces decisions (input: a decision { kind, title, choice, alternatives, reversible, repo, session }; branches must be ask, tell, log, and each branch's derive node returns { verdict, reason }). It only ever runs in shadow beside the champion until a trial supports it.
+scope "internal": a challenger to how hcp surfaces decisions (input: a decision { kind, title, choice, alternatives, reversible, reach, repo, session }; branches must be ask, tell, log, and each branch's derive node returns { verdict, reason }). It only ever runs in shadow beside the champion until a trial supports it. A fixed floor sits under every surface pipeline: a decision marked reversible: false or reach shared/notifies is asked whatever the pipeline says, so don't spend nodes on that.
 scope "external": a pipeline for the person's task; run it with action "run".`
 
 /** The `mcp__hcp__pipeline` tool: describe, define, run, list. */
