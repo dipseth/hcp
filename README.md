@@ -8,6 +8,8 @@ Clickable seams between you and Claude, so a decision is a click instead of a pa
 - **handoff**: a step only you can do. An expired gcloud/bq login in any Bash call raises one automatically, and Claude is told to stop retrying. **Run it** opens the browser login and then verifies with a bq dry run. **Put in prompt** fills `! <command>`. An MCP server that needs authorizing raises one too, the first time Claude searches for its tools; the pane also shows a 🔑 line while the engine lists any server as needing auth.
 - **share**: text for somewhere else. **Copy formatted** puts HTML and plain text on the clipboard together, so bold, lists and links survive the paste into Slack, mail or a doc; **Copy plain** is text alone. A note asks Claude for a change.
 
+Any card can carry **`links`**: the PR, issue, CI run, deploy, doc or thread the choice rests on. They draw on the card and go into the Evidence reel (below).
+
 **Every answer has three deliveries:**
 
 - **Send** starts a turn.
@@ -40,6 +42,16 @@ Clickable seams between you and Claude, so a decision is a click instead of a pa
 - `/later [30m|2h|9am|14:30|tomorrow] <message>`: schedule a message.
 
 Scheduled messages live as long as the session: closing it drops them.
+
+## Evidence reel
+
+The links a decision rests on shouldn't need scrolling back through the chat. The **Evidence** section at the top of the pane keeps them: clickable on every surface (an OSC 8 link in the terminal, an anchor on desktop and VS Code), with **⤢ Open** for terminals that don't draw links, each with its kind (github, jira, doc, deploy, email…), what it backs (`for c3`), and how it got there. Links arrive three ways:
+
+- **Claude, on purpose.** `links` on an `ask`, `handoff`, `share` or `decided` call, with a `label` and a one-line `why`; or the `mcp__hcp__evidence` tool: `add` puts links in, `update` changes an entry by its id (a draft became a PR, a run was re-run) and shows `↻ was:` under it, `drop` retires one. Entries are `e<n>`, and Claude is told to refer to them by id rather than repeat the URLs.
+- **Found in passing.** Every link in Claude's reply at the end of a turn, and the URLs that `gh`, `glab`, `vercel` and `git push` print (the PR just created, the deploy just made). The same place arriving twice is one entry; an explicit source outranks a found one.
+- **You.** Type a URL and a few words into the reel's field: it's pinned at the top and Claude gets a note (`[HCP e4 · NNTR] The person added evidence…`) so it counts as key context.
+
+The reel shows pinned entries first, then what backs an open card, then what Claude or you put in on purpose, then what was found, newest first; the top 8 by default, **show all** for the rest. **📌 Pin** keeps one on top, **×** retires it. Retired and superseded entries stay dim under show all until **Clear stale**, so a change of course is visible, not erased. `/hcp clear` leaves the reel alone.
 
 ## Reach: calls that contact people
 

@@ -6,8 +6,24 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderSurface } from 'claude-code'
 
-import type { HcpApproval, HcpCard, HcpDecision, HcpDelivery, HcpGrant, HcpMedia, HcpMode, HcpOutward, HcpScheduled } from '../types'
+import type { HcpApproval, HcpCard, HcpDecision, HcpDelivery, HcpEvidence, HcpGrant, HcpLink, HcpMedia, HcpMode, HcpOutward, HcpScheduled } from '../types'
 import { bindSession, loadHistory, pipelineTool, resolved, shadow, shadowReport } from './decide'
+import {
+  EVIDENCE_TOOL,
+  LINK_COMMANDS,
+  addedLinkNote,
+  commandLabel,
+  dropEvidence,
+  evidenceText,
+  harvestLinks,
+  mergeEvidence,
+  normalizeHref,
+  parseLinks,
+  parseTypedLink,
+  rankEvidence,
+  updateEvidence,
+} from './evidence'
+import type { EvidenceMeta } from './evidence'
 import { useOptions } from './langfuse'
 import { existing, expandAll, pastedImages, prepare, saveBytes, thumbnails } from './media'
 import { appendLedger, generatePort, initObservability, reachPorts, scoresPort } from './ports'
@@ -78,6 +94,49 @@ const grants = atom({ plugin: 'hcp', key: 'grants' } as const, [] as HcpGrant[])
 const outward = atom({ plugin: 'hcp', key: 'outward' } as const, [] as HcpOutward[])
 const approvals = atom({ plugin: 'hcp', key: 'approvals' } as const, [] as HcpApproval[])
 const decisions = atom({ plugin: 'hcp', key: 'decisions' } as const, [] as HcpDecision[])
+const evidence = atom({ plugin: 'hcp', key: 'evidence' } as const, [] as HcpEvidence[])
+const evidenceSeq = atom({ plugin: 'hcp', key: 'evidenceSeq' } as const, 0)
+const showAllEvidence = atom({ plugin: 'hcp', key: 'showAllEvidence' } as const, false)
+// Bumped after each link the person adds, so the reel's field draws empty again.
+let linkSent = 0
+
+/** Links into the reel, merged with what's there; the ids they have now, in order. */
+async function addEvidence($: Engine, links: readonly HcpLink[], meta: EvidenceMeta): Promise<string[]> {
+  if (links.length === 0) return []
+  const at = await $.clock.now()
+  let n = await read($, evidenceSeq)
+  let ids: string[] = []
+  await update($, evidence, list => {
+    const merged = mergeEvidence(list, links, meta, at, () => `e${++n}`)
+    ids = merged.ids
+
+    return merged.list
+  })
+  await update($, evidenceSeq, () => n)
+
+  return ids
+}
+
+/** A tool's `links`, as card fields. */
+function linkFields(input: Record<string, unknown>): Pick<HcpCard, 'links'> {
+  const links = parseLinks(input.links)
+
+  return links.length > 0 ? { links } : {}
+}
+
+/** A card's links into the reel as backing it, and its draft's links as found there; the ids of the former. */
+async function keepCardLinks($: Engine, card: Pick<HcpCard, 'id' | 'links'>, draft?: string): Promise<string[]> {
+  const ids = await addEvidence($, card.links ?? [], { source: 'card', cardId: card.id })
+  if (draft) void harvestInto($, draft, { source: 'card', cardId: card.id })
+
+  return ids
+}
+
+/** The URLs in a reply or a card's text, into the reel as found in passing. */
+async function harvestInto($: Engine, text: string, meta: EvidenceMeta) {
+  if (!text || !/https?:\/\//.test(text)) return
+  await addEvidence($, harvestLinks(text), meta).catch(() => undefined)
+}
 
 // This session's decisions, mirrored so the surface pipeline's precedents read them without a $ call.
 let liveDecisions: HcpDecision[] = []
@@ -934,6 +993,36 @@ function actionsFor($: Engine): Actions {
     unattach: at => void update($, outbox, list => list.filter((_, i) => i !== at)),
     clearAttachments: () => void update($, outbox, () => []),
     clearFromYou: () => void update($, fromYou, () => []),
+    openLink: href => {
+      if (!/^(https?:\/\/|mailto:|file:\/\/)/i.test(href)) {
+        $.ui.toast(`Not a link hcp opens: ${clip(href, 60)}`)
+
+        return
+      }
+      void $.process.run(['open', href], { timeoutMs: 10_000 }).then(
+        ran => ran.exitCode === 0 || $.ui.toast(`Couldn't open ${clip(href, 60)}`),
+        () => $.ui.toast(`Open it yourself: ${href}`),
+      )
+    },
+    pinEvidence: id => void update($, evidence, list => list.map(e => (e.id === id ? { ...e, isPinned: !e.isPinned } : e))),
+    dropEvidence: id => void update($, evidence, list => dropEvidence(list, id)),
+    addLink: text =>
+      void (async () => {
+        const link = parseTypedLink(text)
+        if (!link) {
+          $.ui.toast('Paste a URL (https, mailto or file), then a label.')
+
+          return
+        }
+        linkSent += 1
+        const [id] = await addEvidence($, [link], { source: 'you' })
+        if (id === undefined) return
+        await update($, evidence, list => list.map(e => (e.id === id ? { ...e, isPinned: true } : e)))
+        await deliver($, addedLinkNote(link, id), 'nntr')
+        $.ui.toast(`Pinned as ${id}. Claude knows.`)
+      })(),
+    toggleAllEvidence: () => void update($, showAllEvidence, value => !value),
+    clearStale: () => void update($, evidence, list => list.filter(e => e.status !== 'stale')),
     move: step =>
       void (async () => {
         const open = await openCards($)
@@ -1002,7 +1091,80 @@ async function snapshot($: Engine, surface: RenderSurface): Promise<Snapshot> {
     now: at,
     // Read through the atom, so the pane redraws when a decision changes.
     decided: (await read($, decisions)).filter(d => d.source === 'decided').slice(-5).reverse(),
+    evidence: rankEvidence(
+      await read($, evidence),
+      open.map(c => c.id),
+    ),
+    showAllEvidence: await read($, showAllEvidence),
+    linkSent,
   }
+}
+
+/** The evidence tool: add, update by id (or href), drop. */
+async function evidenceTool($: Engine, input: Record<string, unknown>): Promise<string> {
+  const action = input.action
+  if (action !== 'add' && action !== 'update' && action !== 'drop') return 'evidence needs `action`: add, update or drop.'
+  const items = Array.isArray(input.items) ? (input.items as Record<string, unknown>[]) : []
+  const problems: string[] = []
+  const ids: string[] = []
+  const at = await $.clock.now()
+  const forOf = (item: Record<string, unknown>) => (typeof item.for === 'string' && item.for.trim() ? item.for.trim() : undefined)
+
+  if (action === 'add') {
+    for (const item of items) {
+      const [link] = parseLinks([item])
+      if (!link) {
+        problems.push(`Skipped ${typeof item.href === 'string' ? item.href : 'an item'}: needs an https, mailto or file href.`)
+        continue
+      }
+      const cardId = forOf(item)
+      ids.push(...(await addEvidence($, [link], { source: 'claude', ...(cardId !== undefined ? { cardId } : {}) })))
+    }
+
+    return evidenceText('add', ids, problems)
+  }
+
+  const list = await read($, evidence)
+  for (const item of items) {
+    const wantedId = typeof item.id === 'string' ? item.id.trim() : undefined
+    const byId = wantedId === undefined ? undefined : list.find(e => e.id === wantedId)
+    // Without an id, the href names the entry; with one that matches nothing, it's an error, not a guess.
+    const byHref =
+      wantedId === undefined && typeof item.href === 'string'
+        ? list.find(e => normalizeHref(e.href) === normalizeHref(item.href as string))
+        : undefined
+    const found = byId ?? byHref
+    if (!found) {
+      problems.push(`No entry ${wantedId ?? (typeof item.href === 'string' ? `for ${item.href}` : 'named')}; use add.`)
+      continue
+    }
+    if (action === 'drop') {
+      await update($, evidence, l => dropEvidence(l, found.id))
+    } else {
+      const [link] = parseLinks([{ href: typeof item.href === 'string' ? item.href : found.href, label: item.label, why: item.why }])
+      if (!link) {
+        problems.push(`Skipped ${found.id}: the new href isn't https, mailto or file.`)
+        continue
+      }
+      const cardId = forOf(item)
+      await update($, evidence, l =>
+        updateEvidence(
+          l,
+          found.id,
+          {
+            href: link.href,
+            ...(typeof item.label === 'string' && item.label.trim() ? { label: link.label } : {}),
+            ...(typeof item.why === 'string' ? { why: link.why ?? '' } : {}),
+            ...(cardId !== undefined ? { cardId } : {}),
+          },
+          at,
+        ),
+      )
+    }
+    ids.push(found.id)
+  }
+
+  return evidenceText(action, ids, problems)
 }
 
 const DEFAULT_EXTENSION = '~/.claude/hcp.json'
@@ -1059,6 +1221,7 @@ export const register: Register = (on, options) => {
       $.tool.register(withTweak(SHARE_TOOL)),
       $.tool.register(withTweak(DECIDED_TOOL)),
       $.tool.register(withTweak(PIPELINE_TOOL)),
+      $.tool.register(withTweak(EVIDENCE_TOOL)),
       $.command.register({
         name: 'hcp',
         description: 'Open the HCP pane: cards waiting on you, quick replies, steers, mode',
@@ -1094,10 +1257,18 @@ export const register: Register = (on, options) => {
     return next(e)
   })
   on('turn.complete', async ($, e, next) => {
-    if (e.agentId === undefined) isTurnRunning = false
+    if (e.agentId === undefined) {
+      isTurnRunning = false
+      // The links Claude wrote inline stay reachable in the reel once the reply scrolls away.
+      void harvestInto($, e.answer, { source: 'harvest' })
+    }
 
     return next(e)
   })
+
+  on('tool.call', { tool: /^mcp__hcp__evidence$/ }, async ($, e) => ({
+    result: await evidenceTool($, e as unknown as Record<string, unknown>),
+  })).catch(() => ({ deny: 'hcp could not change the reel; carry on.' }))
 
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
@@ -1180,9 +1351,12 @@ export const register: Register = (on, options) => {
       picked: blind ? [] : isMulti ? picked : picked.slice(0, 1),
       ...(blind ? { blind, recommended: isMulti ? picked : picked.slice(0, 1) } : {}),
       ...pictures.fields,
+      ...linkFields(input),
     })
+    const evidenceIds = await keepCardLinks($, card, card.draft)
     const recommended = options.find(o => (card.recommended ?? card.picked).includes(o.value))
     await recordDecision($, {
+      ...(evidenceIds.length > 0 ? { evidence: evidenceIds } : {}),
       id: card.id,
       source: 'ask',
       kind: typeof input.kind === 'string' && input.kind.trim() ? input.kind.trim() : 'general',
@@ -1203,7 +1377,9 @@ export const register: Register = (on, options) => {
       return { deny: 'decided needs `title`, `choice` and `kind`.' }
     }
     const n = liveDecisions.filter(d => d.source === 'decided').length + 1
+    const evidenceIds = await keepCardLinks($, { id: `d${n}`, ...linkFields(input) })
     const decision = await recordDecision($, {
+      ...(evidenceIds.length > 0 ? { evidence: evidenceIds } : {}),
       id: `d${n}`,
       source: 'decided',
       kind: input.kind.trim() || 'general',
@@ -1235,7 +1411,9 @@ export const register: Register = (on, options) => {
       ...(typeof input.detail === 'string' ? { detail: input.detail } : {}),
       ...(typeof input.fix === 'string' ? { fix: input.fix } : {}),
       ...pictures.fields,
+      ...linkFields(input),
     })
+    await keepCardLinks($, card)
     void $.ui.notify(card.title, { title: 'Claude needs you' })
 
     return { result: postedText(card) + pictures.note }
@@ -1256,7 +1434,9 @@ export const register: Register = (on, options) => {
       draft: input.text,
       ...(typeof input.audience === 'string' ? { audience: input.audience } : {}),
       ...pictures.fields,
+      ...linkFields(input),
     })
+    await keepCardLinks($, card, input.text)
 
     return { result: postedText(card) + pictures.note }
   }).catch(() => ({ deny: 'hcp could not post the card; print the text this time.' }))
@@ -1295,10 +1475,20 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const ran = await next(e)
     if (ran.deny !== undefined) return ran
-    const result = ran.result as { stderr?: unknown } | undefined
+    const result = ran.result as { stdout?: unknown; stderr?: unknown } | undefined
     const scanned = ran.isError ? (ran.text ?? '') : typeof result?.stderr === 'string' ? result.stderr : ''
     const name = detectService(e.command, scanned)
     if (name !== undefined) await raiseAuthHandoff($, name, e.tool_use_id, e.command, e.agentId)
+    // A PR, issue or deploy a CLI just made prints its URL once: keep it.
+    if (LINK_COMMANDS.test(e.command) && !ran.isError) {
+      const out = [typeof result?.stdout === 'string' ? result.stdout : '', typeof result?.stderr === 'string' ? result.stderr : ''].join('\n')
+      const label = commandLabel(e.command)
+      await addEvidence(
+        $,
+        harvestLinks(out).map(l => ({ ...l, label: l.label === l.href || /^[\w.-]+\//.test(l.label) ? `${label}: ${l.label}` : l.label })),
+        { source: 'tool', toolUseId: e.tool_use_id },
+      ).catch(() => undefined)
+    }
 
     return ran
   }).catch(($, e, next) => next(e))

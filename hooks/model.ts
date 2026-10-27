@@ -20,6 +20,7 @@ const protocolRules = (watched: string) => [
   '- To give a decision in the task a decision pipeline (a model estimates, code decides, the person corrects it later), or to propose a better way for hcp to choose what to ask, use mcp__hcp__pipeline: `describe` first, then `define`, then `run`.',
   "- Cards don't block. Keep going on work that doesn't need the answer, or end your turn with one short line.",
   '- Pictures belong on the card: pass screenshots, renders or charts the person should look at in `media` (absolute paths, a one-line `caption` each; a video is sampled into frames) on any of the three tools, instead of describing them in prose.',
+  '- Evidence belongs in the reel: when a link backs a decision or is something the person will want again (a PR, issue, CI run, deploy, doc, thread), pass it in `links` on the card or decided call, or call mcp__hcp__evidence `add`. When the target moves (a draft becomes a PR, a run is re-run), `update` the same `e<n>` id; `drop` what no longer applies. Keep writing inline links in replies too; hcp harvests them into the reel. "[HCP e<n> · NNTR]" is a link the person added themselves: key context.',
   '- A message ending in "Attached, view each with Read before acting:" carries the person\'s images or video frames: Read every listed path before you answer.',
 ]
 
@@ -68,6 +69,28 @@ const MEDIA_PROPS = {
   },
 } as const
 
+/** At most this many links on one card or in one evidence call. */
+export const MAX_LINKS = 12
+
+// Defined here, not in evidence.ts, since the tool schemas below spread it at load time.
+export const LINK_PROPS = {
+  links: {
+    type: 'array',
+    maxItems: MAX_LINKS,
+    description:
+      'The evidence for this: links to the PR, issue, CI run, deploy, doc or thread the person should be able to click. They draw on the card and stay in the Evidence reel of the HCP pane.',
+    items: {
+      type: 'object',
+      properties: {
+        href: { type: 'string', description: 'https, mailto or file URL.' },
+        label: { type: 'string', description: 'A few words: "PR #412", "CI run", "design doc".' },
+        why: { type: 'string', description: 'One line on why it matters here.' },
+      },
+      required: ['href', 'label'],
+    },
+  },
+} as const
+
 export const ASK_TOOL = {
   name: 'ask',
   description:
@@ -109,6 +132,7 @@ export const ASK_TOOL = {
         description: 'Who acting on the choice reaches: shared (others see it) or notifies (people get a message) is always asked, and hides your recommendation until the person picks.',
       },
       ...MEDIA_PROPS,
+      ...LINK_PROPS,
     },
     required: ['title', 'options'],
   } satisfies Schema,
@@ -126,6 +150,7 @@ export const HANDOFF_TOOL = {
       detail: { type: 'string', description: 'What it unblocks.' },
       fix: { type: 'string', description: 'The command they run, if there is one.' },
       ...MEDIA_PROPS,
+      ...LINK_PROPS,
     },
     required: ['title'],
   } satisfies Schema,
@@ -143,6 +168,7 @@ export const SHARE_TOOL = {
       text: { type: 'string', description: 'The text to paste, in markdown.' },
       audience: { type: 'string', description: 'Where it goes: Slack channel, email, PR or issue comment.' },
       ...MEDIA_PROPS,
+      ...LINK_PROPS,
     },
     required: ['title', 'text'],
   } satisfies Schema,
@@ -167,6 +193,7 @@ export const DECIDED_TOOL = {
         enum: ['local', 'own', 'shared', 'notifies'],
         description: 'Who the choice reaches: shared or notifies means it should have been an mcp__hcp__ask instead.',
       },
+      ...LINK_PROPS,
     },
     required: ['title', 'choice', 'kind'],
   } satisfies Schema,

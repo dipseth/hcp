@@ -1,6 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
+import { harvestLinks, kindOf, parseTypedLink } from '../hooks/evidence'
 import { callKey, classifyCall, gateOf, parseTags, redact } from '../hooks/reach'
 import { SURFACE_SPEC, betaLower, evidenceOf, similarPrecedents, withFloor } from '../hooks/surface'
 import {
@@ -1030,4 +1031,186 @@ test('the person can edit a held message: the edited call goes through, the orig
   expect((await $.tool.call({ tool: 'Bash', command: edited })).deny).toBe(undefined)
   expect(ran).toEqual([edited])
   await ui.unmount()
+})
+
+/** The engine beneath a turn: a test calls it before its first `$` call. */
+function turns(on: On) {
+  on('turn.start', (_, e) => ({ turnId: e.turnId ?? 'turn-1' }))
+  on('turn.complete', (_, e) => ({ text: e.answer }))
+}
+
+/** A turn Claude finished with `answer` as its reply, as the engine would raise it. */
+async function replied($: { turn: { start: (e: never) => Promise<unknown>; complete: (e: never) => Promise<unknown> } }, answer: string) {
+  await $.turn.start({ turnId: 'turn-1' } as never)
+  await $.turn.complete({ turnId: 'turn-1', answer, durationMs: 1, isAborted: false, reason: 'answer' } as never)
+  await settle()
+}
+
+/** The labels of the Links drawn, in order. */
+const linkLabels = async (ui: { findAll: (q: { type: string }) => Promise<{ props: Record<string, unknown> }[]> }) =>
+  (await ui.findAll({ type: 'Link' })).map(l => String(l.props.label))
+
+test('links on a card draw on it and in the reel, Open runs the browser, and the same href merges into one entry', async ($, on) => {
+  engine(on)
+  const ran = pictures(on)
+  await $.session.start({ cwd: '/work/hcp', surface: 'vscode', isInteractive: true })
+
+  const posted = await $.tool.call({
+    tool: 'mcp__hcp__ask',
+    title: 'Merge it?',
+    options: [
+      { value: 'yes', label: 'Yes' },
+      { value: 'no', label: 'No' },
+    ],
+    links: [
+      { href: 'https://github.com/dipseth/hcp/pull/41', label: 'PR #41', why: 'the change under review' },
+      { href: 'https://github.com/dipseth/hcp/actions/runs/9', label: 'CI run' },
+    ],
+  } as never)
+  expect(idOf(posted)).toBe('c1')
+  await settle()
+
+  for (const surface of ['terminal', 'vscode'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ type: 'Text', text: /Evidence \(2\)/ })).toBeDefined()
+    // Once in the reel, once on the card itself.
+    expect((await linkLabels(ui)).filter(l => l === 'PR #41').length).toBe(2)
+    expect(await ui.find({ type: 'Text', text: /github · for c1/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /the change under review/ })).toBeDefined()
+    await ui.press({ key: 'e1-open' })
+    await settle()
+    expect(ran.some(argv => argv[0] === 'open' && argv[1] === 'https://github.com/dipseth/hcp/pull/41')).toBe(true)
+    await ui.unmount()
+  }
+
+  const decided = await $.tool.call({
+    tool: 'mcp__hcp__decided',
+    title: 'Which runner?',
+    choice: 'ubuntu-latest',
+    kind: 'ci',
+    links: [{ href: 'https://github.com/dipseth/hcp/pull/41/', label: 'PR #41 again' }],
+  } as never)
+  expect(String(decided.result)).toMatch(/^Recorded d1\./)
+  await settle()
+  const ui = await $.ui.mount({ ...PANE, surface: 'vscode' })
+  // The same place with a trailing slash merged into e1: still two entries, backing the card it met first.
+  expect(await ui.find({ type: 'Text', text: /Evidence \(2\)/ })).toBeDefined()
+  expect(await ui.find({ key: 'e3-open' })).toBe(undefined)
+  expect(await ui.find({ type: 'Text', text: /github · for c1/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the evidence tool adds, updates in place with history, and drops; replies and CLI output are harvested without duplicates', async ($, on) => {
+  engine(on)
+  pictures(on)
+  turns(on)
+  on('tool.call', { tool: 'Bash' }, () => ({
+    result: { stdout: '', stderr: 'remote: Create a pull request by visiting:\nremote:   https://github.com/dipseth/hcp/pull/new/main\n', exitCode: 0 },
+    text: 'pushed',
+  }))
+  await $.session.start({ cwd: '/work/hcp', surface: 'vscode', isInteractive: true })
+
+  const added = await $.tool.call({
+    tool: 'mcp__hcp__evidence',
+    action: 'add',
+    items: [
+      { href: 'https://github.com/dipseth/hcp/issues/7', label: 'Issue #7', why: 'what we are fixing' },
+      { href: 'not a link', label: 'nope' },
+    ],
+  } as never)
+  expect(String(added.result)).toMatch(/^In the reel: e1\. Skipped not a link/)
+
+  // A reply that names the same issue and a new doc: one new entry, no duplicate.
+  await replied($, 'Filed under [the issue](https://github.com/dipseth/hcp/issues/7#top) with notes in https://docs.google.com/document/d/abc/edit.')
+
+  // A push printed where to open the PR, once.
+  await $.tool.call({ tool: 'Bash', command: 'git push origin main' } as never)
+  await settle()
+
+  let ui = await $.ui.mount({ ...PANE, surface: 'vscode' })
+  expect(await ui.find({ type: 'Text', text: /Evidence \(3\)/ })).toBeDefined()
+  expect(await linkLabels(ui)).toEqual(['Issue #7', 'git push origin: github.com/dipseth/hcp/pull/new/main', 'docs.google.com/document/d/abc/edit'])
+  expect(await ui.find({ type: 'Text', text: /doc · from a reply/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /github · from output/ })).toBeDefined()
+  await ui.unmount()
+
+  const updated = await $.tool.call({
+    tool: 'mcp__hcp__evidence',
+    action: 'update',
+    items: [
+      { id: 'e1', href: 'https://github.com/dipseth/hcp/pull/43', label: 'PR #43 (closes #7)' },
+      { id: 'e9', href: 'https://x.y' },
+    ],
+  } as never)
+  expect(String(updated.result)).toMatch(/^Updated e1\. No entry e9; use add\./)
+
+  ui = await $.ui.mount({ ...PANE, surface: 'vscode' })
+  expect((await linkLabels(ui))[0]).toBe('PR #43 (closes #7)')
+  expect(await ui.find({ type: 'Text', text: /↻ was: Issue #7/ })).toBeDefined()
+  await ui.unmount()
+
+  const dropped = await $.tool.call({
+    tool: 'mcp__hcp__evidence',
+    action: 'drop',
+    items: [{ href: 'https://docs.google.com/document/d/abc/edit' }],
+  } as never)
+  expect(String(dropped.result)).toMatch(/^Dropped e2\./)
+  ui = await $.ui.mount({ ...PANE, surface: 'vscode' })
+  expect(await ui.find({ type: 'Text', text: /Evidence \(2\)/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /superseded/ })).toBe(undefined)
+  await ui.press({ key: 'evidence-all' })
+  expect(await ui.find({ type: 'Text', text: /superseded/ })).toBeDefined()
+  await ui.press({ key: 'evidence-clear-stale' })
+  expect(await ui.find({ type: 'Text', text: /superseded/ })).toBe(undefined)
+  await ui.unmount()
+})
+
+test("a link the person adds is pinned first and goes to Claude as a note; a card's link ranks above a harvested one", async ($, on) => {
+  engine(on)
+  pictures(on)
+  turns(on)
+  const session = mock.session(on)
+  await $.session.start({ cwd: '/work/hcp', surface: 'vscode', isInteractive: true })
+
+  await replied($, 'See https://sentry.io/issues/1 for the trace.')
+  await $.tool.call({
+    tool: 'mcp__hcp__handoff',
+    title: 'Approve the deploy',
+    links: [{ href: 'https://vercel.com/dipseth/hcp/deployments/d1', label: 'the deploy' }],
+  } as never)
+  await settle()
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'vscode' })
+  await ui.input({ key: 'add-link-0', text: 'https://mail.google.com/mail/u/0/#inbox/abc the thread with ops' })
+  await settle()
+  const notes = session.appended().map(row => JSON.stringify(row.message.content))
+  expect(
+    notes.some(t =>
+      t.includes('[HCP e3 · NNTR] The person added evidence to the reel: the thread with ops https://mail.google.com/mail/u/0/#inbox/abc'),
+    ),
+  ).toBe(true)
+
+  // Pinned first, then the open card's link, then what a reply mentioned; the handoff card draws its link too.
+  expect(await linkLabels(ui)).toEqual(['the thread with ops', 'the deploy', 'sentry.io/issues/1', 'the deploy'])
+  expect(await ui.find({ type: 'Text', text: /you added/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('harvest finds markdown and bare links once each, kinds come from the host, and typed text splits into a link and label', () => {
+  const found = harvestLinks(
+    'Opened [PR #5](https://github.com/o/r/pull/5). CI at https://github.com/o/r/actions/runs/1, and again https://github.com/o/r/pull/5/. ```https://example.com/in-a-fence```',
+  )
+  expect(found).toEqual([
+    { href: 'https://github.com/o/r/pull/5', label: 'PR #5' },
+    { href: 'https://github.com/o/r/actions/runs/1', label: 'github.com/o/r/actions/runs/1' },
+  ])
+  expect(kindOf('https://dipseth.atlassian.net/browse/HCP-1')).toBe('jira')
+  expect(kindOf('https://mail.google.com/mail/u/0/')).toBe('email')
+  expect(kindOf('https://claude.ai/artifact/abc')).toBe('artifact')
+  expect(kindOf('https://example.com')).toBe('app')
+  expect(parseTypedLink('the design doc https://docs.google.com/document/d/1/edit, final')).toEqual({
+    href: 'https://docs.google.com/document/d/1/edit',
+    label: 'the design doc final',
+  })
+  expect(parseTypedLink('no link here')).toBe(undefined)
 })

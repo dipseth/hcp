@@ -3,9 +3,10 @@
 // goes through `Actions`, so these functions only read. The mode's color is
 // the inbox's accent, and each kind of card has its own.
 
-import type { ElementTable, RenderSurface } from 'claude-code'
+import type { ElementTable, RenderNode, RenderSurface } from 'claude-code'
 
-import type { HcpCard, HcpDecision, HcpDelivery, HcpGrant, HcpMedia, HcpMode, HcpOutward, HcpScheduled } from '../types'
+import type { HcpCard, HcpDecision, HcpDelivery, HcpEvidence, HcpGrant, HcpLink, HcpMedia, HcpMode, HcpOutward, HcpScheduled } from '../types'
+import { KIND_ICON, REEL_SIZE } from './evidence'
 import { STEERS, clip, labels, services } from './model'
 import type { ReachChoice, Steer } from './model'
 
@@ -47,6 +48,14 @@ export type Actions = {
   disagree: (id: string) => void
   /** Replace Claude's recorded choice with the person's own. */
   change: (id: string, text?: string) => void
+  /** The Evidence reel: open a link in the browser, keep one on top, retire one, add your own. */
+  openLink: (href: string) => void
+  pinEvidence: (id: string) => void
+  dropEvidence: (id: string) => void
+  /** `url label words` typed into the reel's field. */
+  addLink: (text: string) => void
+  toggleAllEvidence: () => void
+  clearStale: () => void
 }
 
 export type Snapshot = {
@@ -70,6 +79,11 @@ export type Snapshot = {
   now: number
   /** Decisions Claude recorded itself, newest first. */
   decided: HcpDecision[]
+  /** The Evidence reel in the order it draws: pinned, backing an open card, explicit, found, stale. */
+  evidence: HcpEvidence[]
+  showAllEvidence: boolean
+  /** Bumped after each link the person adds, so the field draws empty again. */
+  linkSent: number
 } & Pictures
 
 /** How pictures draw: the terminal's Image reads files, other surfaces' Svg carries bytes. */
@@ -149,6 +163,127 @@ function answeredRow(els: ElementTable, card: HcpCard) {
 }
 
 const baseName = (path: string) => path.slice(path.lastIndexOf('/') + 1)
+
+/** One link as the surface draws it: a Link (OSC 8 on the terminal, an anchor elsewhere), else its label and dim href. */
+function linkText(els: ElementTable, link: HcpLink, isDim = false) {
+  const { Text } = els
+  if ('Link' in els) {
+    const { Link } = els
+
+    return (
+      <Text dimColor={isDim} underline={!isDim}>
+        <Link href={link.href} label={link.label} />
+      </Text>
+    )
+  }
+
+  return (
+    <Text dimColor={isDim}>
+      {link.label} <Text dimColor>{clip(link.href, 60)}</Text>
+    </Text>
+  )
+}
+
+/** A card's links under its detail: the evidence next to the choice. */
+function linksRow(els: ElementTable, id: string, links: readonly HcpLink[] | undefined, act: Actions) {
+  if (!links || links.length === 0) return null
+  const { Box, Text, Button } = els
+
+  return (
+    <Box flexDirection="column">
+      {links.map((l, at) => (
+        <Box key={`${id}-link-${at}`} flexDirection="row" gap={1} flexWrap="wrap">
+          <Text dimColor>🔗</Text>
+          {linkText(els, l)}
+          {l.why && <Text dimColor>· {clip(l.why, 70)}</Text>}
+          <Button key={`${id}-link-open-${at}`} label="⤢" plain dimColor onPress={() => act.openLink(l.href)} />
+        </Box>
+      ))}
+    </Box>
+  )
+}
+
+const SOURCE_LABEL = { claude: 'Claude', card: 'card', harvest: 'from a reply', tool: 'from output', you: 'you added' } as const
+
+const agoText = (at: number, now: number) => {
+  const m = Math.round((now - at) / 60_000)
+
+  return m < 1 ? 'now' : m < 90 ? `${m}m ago` : `${Math.round(m / 60)}h ago`
+}
+
+/** One entry of the reel: the link, what it is, what it backs, and pin / drop. */
+function evidenceRow(els: ElementTable, e: HcpEvidence, act: Actions, now: number) {
+  const { Box, Text, Button } = els
+  const isStale = e.status === 'stale'
+  const was = e.was?.[0]
+  const context = [
+    e.kind !== 'app' ? e.kind : '',
+    e.cardId !== undefined ? `for ${e.cardId}` : '',
+    e.source === 'card' || e.source === 'claude' ? '' : SOURCE_LABEL[e.source],
+    agoText(e.updatedAt, now),
+  ].filter(Boolean)
+
+  return (
+    <Box key={`evidence-${e.id}`} flexDirection="column">
+      <Box flexDirection="row" gap={1} flexWrap="wrap">
+        <Text dimColor={isStale}>
+          {e.isPinned ? '📌' : KIND_ICON[e.kind]} {badge(els, e.id, isStale ? '#64748B' : THEME.ask)}
+        </Text>
+        {linkText(els, e, isStale)}
+        <Text dimColor>
+          · {isStale ? 'superseded · ' : ''}
+          {context.join(' · ')}
+        </Text>
+        <Button key={`${e.id}-open`} label="⤢ Open" plain dimColor onPress={() => act.openLink(e.href)} />
+        {!isStale && (
+          <Button key={`${e.id}-pin`} label={e.isPinned ? 'Unpin' : '📌 Pin'} plain dimColor onPress={() => act.pinEvidence(e.id)} />
+        )}
+        {!isStale && <Button key={`${e.id}-drop`} label="×" plain dimColor onPress={() => act.dropEvidence(e.id)} />}
+      </Box>
+      {e.why && <Text dimColor>   {clip(e.why, 100)}</Text>}
+      {was && (
+        <Text dimColor>
+          {'   '}↻ was: {clip(was.label, 50)} <Text dimColor>{clip(was.href, 50)}</Text>
+        </Text>
+      )}
+    </Box>
+  )
+}
+
+/** The reel: the links the session's decisions rest on, always in view, never scrolled for. */
+function evidenceReel(els: ElementTable, s: Snapshot, act: Actions, section: (title: string) => RenderNode) {
+  const { Box, Text, Button } = els
+  const Input = 'Input' in els ? els.Input : undefined
+  const live = s.evidence.filter(e => e.status === 'live')
+  const stale = s.evidence.length - live.length
+  const shown = s.showAllEvidence ? s.evidence : live.slice(0, REEL_SIZE)
+  const hidden = s.evidence.length - shown.length
+
+  return (
+    <Box flexDirection="column">
+      <Box flexDirection="row" gap={1} flexWrap="wrap">
+        {section(live.length === 0 ? 'Evidence' : `Evidence (${live.length})`)}
+        {hidden > 0 && (
+          <Button key="evidence-all" label={`show all ${s.evidence.length}`} plain dimColor onPress={act.toggleAllEvidence} />
+        )}
+        {s.showAllEvidence && s.evidence.length > 0 && <Button key="evidence-top" label="show top" plain dimColor onPress={act.toggleAllEvidence} />}
+        {s.showAllEvidence && stale > 0 && <Button key="evidence-clear-stale" label="Clear stale" plain dimColor onPress={act.clearStale} />}
+      </Box>
+      {s.evidence.length === 0 && (
+        <Text dimColor>Links behind the decisions land here: from cards, Claude's replies, gh/vercel output, or one you add below.</Text>
+      )}
+      {shown.map(e => evidenceRow(els, e, act, s.now))}
+      {Input && (
+        <Input
+          key={`add-link-${s.linkSent}`}
+          placeholder="Add a link: the URL then a label, Enter keeps it and tells Claude"
+          submitLabel="add"
+          onSubmit={act.addLink}
+        />
+      )}
+    </Box>
+  )
+}
 
 const svgOf = (base64: string, width: number, height: number) =>
   `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">` +
@@ -349,6 +484,7 @@ function reachCard(els: ElementTable, card: HcpCard, act: Actions, ctx: CardCont
         {r.audience.length > 0 ? ` · to ${clip(r.audience.join(', '), 120)}` : ''}
       </Text>
       {card.detail && <Text dimColor>Why: {card.detail}</Text>}
+      {linksRow(els, id, card.links, act)}
       <Markdown text={`${fence}\n${r.content}\n${fence}`} />
       <Box flexDirection="row" flexWrap="wrap" gap={1}>
         <Button key={`${id}-send`} label="Send" variant="primary" {...key('s')} onPress={() => act.reach(id, 'send')}>
@@ -509,6 +645,7 @@ export function cardView(els: ElementTable, card: HcpCard, act: Actions, ctx: Ca
       </Box>
       {card.detail && <Text dimColor>{card.detail}</Text>}
       {card.audience && <Text dimColor>For: {card.audience}</Text>}
+      {linksRow(els, id, card.links, act)}
       {card.draft && <Markdown text={card.draft} />}
       {mediaBlock(els, card, act, ctx)}
       {blindLine}
@@ -551,7 +688,7 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
   const recent = s.cards.filter(c => c.status === 'answered' || c.status === 'dismissed').slice(-5)
   // The terminal is where the keys are the way in.
   const isTerminal = s.surface === 'terminal'
-  const section = (title: string) => (
+  const section = (title: string): RenderNode => (
     <Text size="heading" weight="bold" color={accent}>
       {title}
     </Text>
@@ -584,6 +721,8 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
           {badge(els, MODES[s.mode].label.toUpperCase(), accent)} <Text dimColor>{MODES[s.mode].blurb}</Text>
         </Text>
       </Box>
+
+      {evidenceReel(els, s, act, section)}
 
       {s.needsAuth.length > 0 && (
         <Box flexDirection="row" gap={1} flexWrap="wrap">
@@ -685,6 +824,12 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
                   <Text dimColor>
                     shadow would {surface.verdict}: {clip(surface.reason, 90)}
                   </Text>
+                )}
+                {linksRow(
+                  els,
+                  d.id,
+                  s.evidence.filter(e => e.cardId === d.id && e.status === 'live'),
+                  act,
                 )}
                 {d.outcome === 'pending' || d.outcome === 'agreed' ? (
                   <Box flexDirection="column">

@@ -1,5 +1,37 @@
 export type HcpOption = { value: string; label: string; hint?: string }
 
+/** A link on a card or in the reel: where it goes, a few words, and why it matters. */
+export type HcpLink = { href: string; label: string; why?: string }
+
+/** What a link is about, from its host; the reel's icon. */
+export type HcpLinkKind = 'github' | 'gitlab' | 'jira' | 'email' | 'doc' | 'deploy' | 'monitor' | 'artifact' | 'local' | 'file' | 'app'
+
+/** Who put a link in the reel: Claude's evidence tool, a card's `links`, a reply, a CLI's output, or the person. */
+export type HcpEvidenceSource = 'claude' | 'card' | 'harvest' | 'tool' | 'you'
+
+/**
+ * One entry of the Evidence reel: a link the session's decisions rest on,
+ * kept current as the work moves (`update` keeps the id and the history).
+ */
+export type HcpEvidence = HcpLink & {
+  /** `e<n>`: what Claude names in update and drop. */
+  id: string
+  kind: HcpLinkKind
+  source: HcpEvidenceSource
+  /** The card or decision it supports (`c3`, `d2`). */
+  cardId?: string
+  /** The tool call whose output printed it. */
+  toolUseId?: string
+  at: number
+  updatedAt: number
+  /** Pinned: first in the reel, never aged out. */
+  isPinned?: boolean
+  /** `stale`: dropped or superseded, drawn dim under show all. */
+  status: 'live' | 'stale'
+  /** Earlier versions after an update, newest first. */
+  was?: HcpLink[]
+}
+
 /**
  * A picture on a card, or one the person sent: the file Claude reads, and the
  * thumbnails the mod made of it. Only paths live here; thumbnail bytes are
@@ -94,6 +126,8 @@ export type HcpCard = {
   armedAt?: number
   /** The person's note on a slide, by its index. */
   slideNotes?: Record<string, string>
+  /** Links Claude attached: the evidence for the choice, also kept in the reel. */
+  links?: HcpLink[]
 }
 
 export type HcpScheduled = {
@@ -180,6 +214,8 @@ export type HcpDecision = {
   reversedFrom?: 'agreed'
   /** The person's replacement for Claude's choice, from Change on a decided card. */
   change?: string
+  /** The reel entries (`e<n>`) that back it. */
+  evidence?: string[]
   /**
    * What each surface pipeline would have done, by pipeline id: the champion and
    * any challenger. `wanted`: the pipeline's own verdict when the floor overrode it.
@@ -210,6 +246,11 @@ declare module 'claude-code' {
       approvals: HcpApproval[]
       /** This session's decisions; earlier sessions' are read from the ledger. */
       decisions: HcpDecision[]
+      /** The Evidence reel: links the decisions rest on. */
+      evidence: HcpEvidence[]
+      evidenceSeq: number
+      /** Whether the reel shows every entry, stale ones included, or the top of the ranking. */
+      showAllEvidence: boolean
     }
   }
 }
