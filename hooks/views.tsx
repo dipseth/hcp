@@ -3,10 +3,12 @@
 // goes through `Actions`, so these functions only read. The mode's color is
 // the inbox's accent, and each kind of card has its own.
 
-import type { ElementTable, RenderNode, RenderSurface } from 'claude-code'
+import type { ElementTable, RenderChildren, RenderNode, RenderSurface } from 'claude-code'
 
 import type { HcpCard, HcpDecision, HcpDelivery, HcpEvidence, HcpGrant, HcpLink, HcpMedia, HcpMode, HcpOutward, HcpScheduled } from '../types'
-import { KIND_ICON, REEL_SIZE } from './evidence'
+import { KIND_ICON } from './evidence'
+import { drawnSections } from './layout'
+import type { Layout, SectionId } from './layout'
 import { STEERS, clip, labels, services } from './model'
 import type { ReachChoice, Steer } from './model'
 
@@ -56,6 +58,13 @@ export type Actions = {
   addLink: (text: string) => void
   toggleAllEvidence: () => void
   clearStale: () => void
+  /** Open or close the reel's add-a-link field, where the layout keeps it behind `+ link`. */
+  toggleAddLink: () => void
+  /** Open or close the ✎ layout field; send what the person wants the pane to look like; undo or reset the spec. */
+  toggleLayoutAsk: () => void
+  askLayout: (text: string) => void
+  undoLayout: () => void
+  resetLayout: () => void
 }
 
 export type Snapshot = {
@@ -84,6 +93,12 @@ export type Snapshot = {
   showAllEvidence: boolean
   /** Bumped after each link the person adds, so the field draws empty again. */
   linkSent: number
+  /** The pane's layout spec, and whether there's an earlier one to undo to. */
+  layout: Layout
+  canUndoLayout: boolean
+  /** Which tucked-away fields are open. */
+  isAddingLink: boolean
+  isAskingLayout: boolean
 } & Pictures
 
 /** How pictures draw: the terminal's Image reads files, other surfaces' Svg carries bytes. */
@@ -256,8 +271,10 @@ function evidenceReel(els: ElementTable, s: Snapshot, act: Actions, section: (ti
   const Input = 'Input' in els ? els.Input : undefined
   const live = s.evidence.filter(e => e.status === 'live')
   const stale = s.evidence.length - live.length
-  const shown = s.showAllEvidence ? s.evidence : live.slice(0, REEL_SIZE)
+  const shown = s.showAllEvidence ? s.evidence : live.slice(0, s.layout.evidence.size)
   const hidden = s.evidence.length - shown.length
+  const add = s.layout.evidence.add
+  const isFieldOpen = Input !== undefined && (add === 'field' || (add === 'button' && s.isAddingLink))
 
   return (
     <Box flexDirection="column">
@@ -268,17 +285,45 @@ function evidenceReel(els: ElementTable, s: Snapshot, act: Actions, section: (ti
         )}
         {s.showAllEvidence && s.evidence.length > 0 && <Button key="evidence-top" label="show top" plain dimColor onPress={act.toggleAllEvidence} />}
         {s.showAllEvidence && stale > 0 && <Button key="evidence-clear-stale" label="Clear stale" plain dimColor onPress={act.clearStale} />}
+        {Input && add === 'button' && (
+          <Button key="evidence-add" label={s.isAddingLink ? '− link' : '+ link'} plain dimColor onPress={act.toggleAddLink} />
+        )}
       </Box>
-      {s.evidence.length === 0 && (
-        <Text dimColor>Links behind the decisions land here: from cards, Claude's replies, gh/vercel output, or one you add below.</Text>
-      )}
+      {s.evidence.length === 0 && s.layout.evidence.hint && <Text dimColor>Links behind decisions collect here.</Text>}
       {shown.map(e => evidenceRow(els, e, act, s.now))}
-      {Input && (
+      {isFieldOpen && Input && (
         <Input
           key={`add-link-${s.linkSent}`}
-          placeholder="Add a link: the URL then a label, Enter keeps it and tells Claude"
-          submitLabel="add"
+          placeholder="URL then a label; Enter keeps it and tells Claude"
+          submitLabel="keep"
           onSubmit={act.addLink}
+        />
+      )}
+    </Box>
+  )
+}
+
+/** The pane's last row: a quiet way to ask Claude to lay it out differently. */
+function layoutRow(els: ElementTable, s: Snapshot, act: Actions) {
+  const { Box, Text, Button } = els
+  const Input = 'Input' in els ? els.Input : undefined
+  if (!Input) return null
+
+  return (
+    <Box key="layout-row" flexDirection="column">
+      <Box flexDirection="row" gap={1} flexWrap="wrap" justifyContent="flex-end">
+        {s.layout.request && !s.isAskingLayout && <Text dimColor>layout: “{clip(s.layout.request, 50)}”</Text>}
+        <Button key="layout-ask" label={s.isAskingLayout ? '✎ close' : '✎ layout'} plain dimColor onPress={act.toggleLayoutAsk} />
+        {s.isAskingLayout && s.canUndoLayout && <Button key="layout-undo" label="↶ undo" plain dimColor onPress={act.undoLayout} />}
+        {s.isAskingLayout && <Button key="layout-reset" label="reset" plain dimColor onPress={act.resetLayout} />}
+      </Box>
+      {s.isAskingLayout && (
+        <Input
+          key="layout-request"
+          placeholder="Describe how this pane should look; Enter sends it to Claude"
+          submitLabel="send"
+          rows={2}
+          onSubmit={act.askLayout}
         />
       )}
     </Box>
@@ -694,9 +739,8 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
     </Text>
   )
 
-  return (
-    <Box flexDirection="column" gap={2} borderStyle="round" borderColor={accent} paddingX={1} paddingY={1}>
-      <Box flexDirection="column">
+  const sections: Record<SectionId, RenderChildren> = {
+    'mode': (<Box flexDirection="column">
         <Box flexDirection="row" flexWrap="wrap" gap={1}>
           {(Object.keys(MODES) as HcpMode[]).map(m => {
             const isOn = s.mode === m
@@ -717,21 +761,19 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
             {big(els, s.isConcise ? '● Concise ON' : '○ Concise off', s.isConcise ? THEME.on : undefined)}
           </Button>
         </Box>
-        <Text>
-          {badge(els, MODES[s.mode].label.toUpperCase(), accent)} <Text dimColor>{MODES[s.mode].blurb}</Text>
-        </Text>
-      </Box>
-
-      {evidenceReel(els, s, act, section)}
-
-      {s.needsAuth.length > 0 && (
+        {s.layout.modeBlurb && (
+          <Text>
+            {badge(els, MODES[s.mode].label.toUpperCase(), accent)} <Text dimColor>{MODES[s.mode].blurb}</Text>
+          </Text>
+        )}
+      </Box>),
+    'auth': (s.needsAuth.length > 0 && (
         <Box flexDirection="row" gap={1} flexWrap="wrap">
           <Text color={THEME.handoff}>🔑 MCP needs auth: {s.needsAuth.join(', ')}</Text>
           <Button key="mcp-auth" label="Authorize" dimColor onPress={act.authorizeMcp} />
         </Box>
-      )}
-
-      <Box flexDirection="column">
+      )),
+    'waiting': (<Box flexDirection="column">
         <Box flexDirection="row" gap={1}>
           {section(open.length === 0 ? 'Nothing waiting on you' : `Waiting on you (${open.length})`)}
           {open.length > 1 && <Button key="nav-prev" label="↑ k" plain dimColor hotkey="k" onPress={() => act.move(-1)} />}
@@ -746,9 +788,9 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
         {live.map(card =>
           cardView(els, card, act, { surface: s.surface, laterLabel: s.laterLabel, thumbs: s.thumbs, hasKeys: card.id === s.active }),
         )}
-      </Box>
-
-      <Box flexDirection="column">
+      </Box>),
+    'evidence': (evidenceReel(els, s, act, section)),
+    'reply': (<Box flexDirection="column">
         {section("Reply to Claude's last message")}
         <Box flexDirection="row" flexWrap="wrap" gap={1}>
           <Button key="q-yes" label="Yes" variant="primary" hotkey="y" onPress={() => act.quick('yes')}>
@@ -795,9 +837,8 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
             </Button>
           </Box>
         )}
-      </Box>
-
-      <Box flexDirection="column">
+      </Box>),
+    'steer': (<Box flexDirection="column">
         {section('Steer the current run')}
         <Box flexDirection="row" flexWrap="wrap" gap={1}>
           {(Object.keys(STEERS) as Steer[]).map(k => (
@@ -806,9 +847,8 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
             </Button>
           ))}
         </Box>
-      </Box>
-
-      {s.decided.length > 0 && (
+      </Box>),
+    'decided': (s.decided.length > 0 && (
         <Box flexDirection="column">
           {section('Claude decided')}
           {s.decided.map(d => {
@@ -876,9 +916,8 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
             )
           })}
         </Box>
-      )}
-
-      {s.grants.length > 0 && (
+      )),
+    'grants': (s.grants.length > 0 && (
         <Box flexDirection="column">
           {section('Active grants')}
           {s.grants.map(g => (
@@ -894,18 +933,16 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
             </Box>
           ))}
         </Box>
-      )}
-
-      {s.outward.length > 0 && (
+      )),
+    'outward': (s.outward.length > 0 && (
         <Box flexDirection="column">
           {section('Outward this session')}
           {s.outward.map(o => (
             <Box key={`outward-${o.toolUseId}`}>{reachBadge(els, o, s.now)}</Box>
           ))}
         </Box>
-      )}
-
-      {s.queue.length > 0 && (
+      )),
+    'scheduled': (s.queue.length > 0 && (
         <Box flexDirection="column">
           {section('Scheduled')}
           {s.queue.map(item => (
@@ -921,9 +958,8 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
             </Box>
           ))}
         </Box>
-      )}
-
-      {s.fromYou.length > 0 && (
+      )),
+    'you-sent': (s.fromYou.length > 0 && (
         <Box flexDirection="column">
           <Box flexDirection="row" gap={1}>
             {section('You sent')}
@@ -931,9 +967,8 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
           </Box>
           {thumbRow(els, s.fromYou, s, 'from-you')}
         </Box>
-      )}
-
-      {recent.length > 0 && (
+      )),
+    'recent': (recent.length > 0 && (
         <Box flexDirection="column">
           <Box flexDirection="row" gap={1}>
             {section('Recent')}
@@ -941,7 +976,19 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
           </Box>
           {recent.map(card => answeredRow(els, card))}
         </Box>
-      )}
+      )),
+  }
+
+  return (
+    <Box flexDirection="column" gap={2} borderStyle="round" borderColor={accent} paddingX={1} paddingY={1}>
+      {drawnSections(s.layout)
+        .filter(id => sections[id])
+        .map(id => (
+          <Box key={`section-${id}`} flexDirection="column">
+            {sections[id]}
+          </Box>
+        ))}
+      {layoutRow(els, s, act)}
     </Box>
   )
 }

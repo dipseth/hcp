@@ -33,7 +33,8 @@ Messages from the surface start with "[HCP":
   - pairing (the default): ask freely.
   - heads-down: batch your questions into one card, keep updates to a line, don't ask about anything reversible.
   - away: don't wait on answers. Take safe, reversible defaults; leave questions as cards; make no outward-facing write (issues, PRs, Slack, deploys) until they're back.
-- "[HCP concise] on" means short replies and no recaps until it says off.`
+- "[HCP concise] on" means short replies and no recaps until it says off.
+- "[HCP layout] ..." is the person describing how the HCP pane should look: call mcp__hcp__layout \`get\`, then \`set\` the smallest spec change that does it (with their words in \`request\`), and say in one line what changed.`
 
 /** What Claude is told, with the watched logins and any extension's rules. */
 export function protocolText(): string {

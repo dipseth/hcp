@@ -24,6 +24,8 @@ import {
   updateEvidence,
 } from './evidence'
 import type { EvidenceMeta } from './evidence'
+import { DEFAULT_LAYOUT, LAYOUT_TOOL, layoutDescription, layoutRequestText, parseLayout } from './layout'
+import type { LayoutFile } from './layout'
 import { useOptions } from './langfuse'
 import { existing, expandAll, pastedImages, prepare, saveBytes, thumbnails } from './media'
 import { appendLedger, generatePort, initObservability, reachPorts, scoresPort } from './ports'
@@ -99,6 +101,65 @@ const evidenceSeq = atom({ plugin: 'hcp', key: 'evidenceSeq' } as const, 0)
 const showAllEvidence = atom({ plugin: 'hcp', key: 'showAllEvidence' } as const, false)
 // Bumped after each link the person adds, so the reel's field draws empty again.
 let linkSent = 0
+const layout = atom({ plugin: 'hcp', key: 'layout' } as const, { current: DEFAULT_LAYOUT } as LayoutFile)
+const isAddingLink = atom({ plugin: 'hcp', key: 'isAddingLink' } as const, false)
+const isAskingLayout = atom({ plugin: 'hcp', key: 'isAskingLayout' } as const, false)
+
+const LAYOUT_FILE = '.claude/hcp/layout.json'
+
+async function layoutPath($: Engine) {
+  const home = await $.env.get('HOME')
+
+  return home === undefined ? undefined : `${home}/${LAYOUT_FILE}`
+}
+
+/** The spec from disk, made whole; the default where there is none or it won't parse. */
+async function loadLayout($: Engine) {
+  const path = await layoutPath($)
+  if (path === undefined) return
+  try {
+    if (!(await $.fs.exists(path))) return
+    const raw = JSON.parse(await $.fs.read(path)) as { current?: unknown; previous?: unknown }
+    const current = parseLayout(raw.current).layout
+    const previous = raw.previous === undefined ? undefined : parseLayout(raw.previous).layout
+    await update($, layout, () => ({ current, ...(previous ? { previous } : {}) }))
+  } catch {
+    $.ui.toast('hcp: ~/.claude/hcp/layout.json is malformed; using the default layout.')
+  }
+}
+
+/** A new spec in force: the pane redraws from the atom, and the file keeps it for the next session. */
+async function saveLayout($: Engine, next: LayoutFile) {
+  await update($, layout, () => next)
+  const path = await layoutPath($)
+  if (path !== undefined) await $.fs.write(path, JSON.stringify(next, null, 2)).catch(() => undefined)
+}
+
+/** The layout tool: get, set, undo, reset. */
+async function layoutTool($: Engine, input: Record<string, unknown>): Promise<string> {
+  const file = await read($, layout)
+  if (input.action === 'get') return layoutDescription(file.current)
+  if (input.action === 'set') {
+    const { layout: next, problems } = parseLayout(input.spec, file.current)
+    await saveLayout($, { current: next, previous: file.current })
+    await update($, isAskingLayout, () => false)
+
+    return `${problems.length > 0 ? `Set, with problems (those parts kept their old value): ${problems.join('; ')}.` : 'Set.'} The pane redrew. Spec now:\n${JSON.stringify(next)}`
+  }
+  if (input.action === 'undo') {
+    if (!file.previous) return 'Nothing to undo.'
+    await saveLayout($, { current: file.previous, previous: file.current })
+
+    return 'Back to the spec before the last set.'
+  }
+  if (input.action === 'reset') {
+    await saveLayout($, { current: DEFAULT_LAYOUT, previous: file.current })
+
+    return 'Back to the default layout.'
+  }
+
+  return 'layout needs `action`: get, set, undo or reset.'
+}
 
 /** Links into the reel, merged with what's there; the ids they have now, in order. */
 async function addEvidence($: Engine, links: readonly HcpLink[], meta: EvidenceMeta): Promise<string[]> {
@@ -1018,10 +1079,26 @@ function actionsFor($: Engine): Actions {
         const [id] = await addEvidence($, [link], { source: 'you' })
         if (id === undefined) return
         await update($, evidence, list => list.map(e => (e.id === id ? { ...e, isPinned: true } : e)))
+        await update($, isAddingLink, () => false)
         await deliver($, addedLinkNote(link, id), 'nntr')
         $.ui.toast(`Pinned as ${id}. Claude knows.`)
       })(),
     toggleAllEvidence: () => void update($, showAllEvidence, value => !value),
+    toggleAddLink: () => void update($, isAddingLink, value => !value),
+    toggleLayoutAsk: () => void update($, isAskingLayout, value => !value),
+    askLayout: text =>
+      void (async () => {
+        if (!text.trim()) {
+          $.ui.toast('Describe the change first, then press Enter.')
+
+          return
+        }
+        $.ui.toast(sentToast(isTurnRunning))
+        await deliver($, layoutRequestText(text), 'now')
+      })(),
+    undoLayout: () =>
+      void layoutTool($, { action: 'undo' }).then(text => $.ui.toast(text === 'Nothing to undo.' ? text : 'Layout undone.')),
+    resetLayout: () => void layoutTool($, { action: 'reset' }).then(() => $.ui.toast('Default layout.')),
     clearStale: () => void update($, evidence, list => list.filter(e => e.status !== 'stale')),
     move: step =>
       void (async () => {
@@ -1097,6 +1174,13 @@ async function snapshot($: Engine, surface: RenderSurface): Promise<Snapshot> {
     ),
     showAllEvidence: await read($, showAllEvidence),
     linkSent,
+    ...(await (async () => {
+      const file = await read($, layout)
+
+      return { layout: file.current, canUndoLayout: file.previous !== undefined }
+    })()),
+    isAddingLink: await read($, isAddingLink),
+    isAskingLayout: await read($, isAskingLayout),
   }
 }
 
@@ -1208,6 +1292,7 @@ export const register: Register = (on, options) => {
       // No process access (tests, a restricted host): keep the environment's own offset.
     }
     await loadExtensions($)
+    await loadLayout($)
     sessionId = await $.session.id().catch(() => 'session')
     repo = e.cwd.replace(/\/+$/, '').split('/').pop() || undefined
     liveDecisions = await read($, decisions)
@@ -1222,6 +1307,7 @@ export const register: Register = (on, options) => {
       $.tool.register(withTweak(DECIDED_TOOL)),
       $.tool.register(withTweak(PIPELINE_TOOL)),
       $.tool.register(withTweak(EVIDENCE_TOOL)),
+      $.tool.register(withTweak(LAYOUT_TOOL)),
       $.command.register({
         name: 'hcp',
         description: 'Open the HCP pane: cards waiting on you, quick replies, steers, mode',
@@ -1265,6 +1351,10 @@ export const register: Register = (on, options) => {
 
     return next(e)
   })
+
+  on('tool.call', { tool: /^mcp__hcp__layout$/ }, async ($, e) => ({
+    result: await layoutTool($, e as unknown as Record<string, unknown>),
+  })).catch(() => ({ deny: 'hcp could not change the layout; tell the person in a line.' }))
 
   on('tool.call', { tool: /^mcp__hcp__evidence$/ }, async ($, e) => ({
     result: await evidenceTool($, e as unknown as Record<string, unknown>),

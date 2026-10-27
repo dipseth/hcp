@@ -51,7 +51,15 @@ The links a decision rests on shouldn't need scrolling back through the chat. Th
 - **Found in passing.** Every link in Claude's reply at the end of a turn, and the URLs that `gh`, `glab`, `vercel` and `git push` print (the PR just created, the deploy just made). The same place arriving twice is one entry; an explicit source outranks a found one.
 - **You.** Type a URL and a few words into the reel's field: it's pinned at the top and Claude gets a note (`[HCP e4 · NNTR] The person added evidence…`) so it counts as key context.
 
+The add-a-link field hides behind a small dim **+ link** until you want it (the layout spec can keep it open or drop it).
+
 The reel shows pinned entries first, then what backs an open card, then what Claude or you put in on purpose, then what was found, newest first; the top 8 by default, **show all** for the rest. **📌 Pin** keeps one on top, **×** retires it. Retired and superseded entries stay dim under show all until **Clear stale**, so a change of course is visible, not erased. `/hcp clear` leaves the reel alone.
+
+## Layout you describe
+
+The pane's layout is a spec, not code: which sections draw, in what order, and a few options (the mode blurb, the reel's size, how its add field shows, its empty-state hint). The default puts the Evidence reel right under the cards waiting on you.
+
+To change it, press the quiet **✎ layout** at the bottom of the pane and say what you want ("evidence first, hide steers, no blurb"). Your words go to Claude, which reads the current spec with `mcp__hcp__layout get` and writes the smallest change that does it with `set`. The pane redraws at once and the row shows what you asked for. **↶ undo** goes back one spec and **reset** to the default. The spec lives in `~/.claude/hcp/layout.json`, so it holds across sessions; a malformed one falls back to the default with a toast. The cards waiting on you can't be hidden.
 
 ## Reach: calls that contact people
 

@@ -225,6 +225,44 @@ export type HcpDecision = {
 
 export type HcpMode = 'pairing' | 'heads-down' | 'away'
 
+/** A section of the HCP pane, as a layout spec names it. */
+export type HcpSectionId =
+  | 'mode'
+  | 'auth'
+  | 'waiting'
+  | 'evidence'
+  | 'reply'
+  | 'steer'
+  | 'decided'
+  | 'grants'
+  | 'outward'
+  | 'scheduled'
+  | 'you-sent'
+  | 'recent'
+
+/** The pane's layout: which sections draw, in what order, and a few options. Claude writes it with mcp__hcp__layout. */
+export type HcpLayout = {
+  /** Sections in draw order; any left out follow in the default order. */
+  order: HcpSectionId[]
+  /** Sections not drawn. `waiting` can't be hidden: cards must reach the person. */
+  hidden: HcpSectionId[]
+  /** The mode blurb under the mode buttons. */
+  modeBlurb: boolean
+  evidence: {
+    /** Entries shown before "show all". */
+    size: number
+    /** The add-a-link field: behind a small `+ link` button, always open, or not at all. */
+    add: 'button' | 'field' | 'off'
+    /** The one-line explanation while the reel is empty. */
+    hint: boolean
+  }
+  /** The person's words that produced this spec, shown on the ✎ layout row. */
+  request?: string
+}
+
+/** The spec on disk: the one in force and the one before it, for undo. */
+export type HcpLayoutFile = { current: HcpLayout; previous?: HcpLayout }
+
 declare module 'claude-code' {
   interface PluginState {
     hcp: {
@@ -251,6 +289,12 @@ declare module 'claude-code' {
       evidenceSeq: number
       /** Whether the reel shows every entry, stale ones included, or the top of the ranking. */
       showAllEvidence: boolean
+      /** The pane's layout spec in force, and the one before it for undo. */
+      layout: HcpLayoutFile
+      /** The reel's add-a-link field, open behind `+ link`. */
+      isAddingLink: boolean
+      /** The ✎ layout field, open. */
+      isAskingLayout: boolean
     }
   }
 }

@@ -1181,6 +1181,9 @@ test("a link the person adds is pinned first and goes to Claude as a note; a car
   await settle()
 
   const ui = await $.ui.mount({ ...PANE, surface: 'vscode' })
+  // The field hides behind a quiet + link until asked for.
+  expect(await ui.find({ key: 'add-link-0' })).toBe(undefined)
+  await ui.press({ key: 'evidence-add' })
   await ui.input({ key: 'add-link-0', text: 'https://mail.google.com/mail/u/0/#inbox/abc the thread with ops' })
   await settle()
   const notes = session.appended().map(row => JSON.stringify(row.message.content))
@@ -1190,8 +1193,8 @@ test("a link the person adds is pinned first and goes to Claude as a note; a car
     ),
   ).toBe(true)
 
-  // Pinned first, then the open card's link, then what a reply mentioned; the handoff card draws its link too.
-  expect(await linkLabels(ui)).toEqual(['the thread with ops', 'the deploy', 'sentry.io/issues/1', 'the deploy'])
+  // The waiting handoff draws its link first; then the reel: pinned, the open card's link, what a reply mentioned.
+  expect(await linkLabels(ui)).toEqual(['the deploy', 'the thread with ops', 'the deploy', 'sentry.io/issues/1'])
   expect(await ui.find({ type: 'Text', text: /you added/ })).toBeDefined()
   await ui.unmount()
 })
@@ -1213,4 +1216,43 @@ test('harvest finds markdown and bare links once each, kinds come from the host,
     label: 'the design doc final',
   })
   expect(parseTypedLink('no link here')).toBe(undefined)
+})
+
+test('the pane follows a layout spec: evidence under the waiting cards by default, and ✎ layout asks Claude, who sets, undoes and resets it', async ($, on) => {
+  const submitted = engine(on)
+  const files = ledger(on)
+  await $.session.start({ cwd: '/work/hcp', surface: 'vscode', isInteractive: true })
+
+  const headings = async (ui: { findAll: (q: { type: string }) => Promise<{ text: string }[]> }) =>
+    (await ui.findAll({ type: 'Text' })).map(t => t.text).filter(t => /^(Evidence|Nothing waiting on you|Steer the current run)/.test(t))
+
+  let ui = await $.ui.mount({ ...PANE, surface: 'vscode' })
+  expect(await headings(ui)).toEqual(['Nothing waiting on you', 'Evidence', 'Steer the current run'])
+
+  // The quiet row at the bottom opens a field; Enter sends the person's words to Claude.
+  await ui.press({ key: 'layout-ask' })
+  await ui.input({ key: 'layout-request', text: 'put evidence first and drop the steers' })
+  await settle()
+  expect(submitted[submitted.length - 1]).toBe('[HCP layout] put evidence first and drop the steers (Change the pane with mcp__hcp__layout: get, then set.)')
+  await ui.unmount()
+
+  expect(String((await $.tool.call({ tool: 'mcp__hcp__layout', action: 'get' } as never)).result)).toMatch(/Sections:\n- mode:/)
+  const set = await $.tool.call({
+    tool: 'mcp__hcp__layout',
+    action: 'set',
+    spec: { order: ['evidence', 'waiting'], hidden: ['steer', 'waiting', 'bogus'], request: 'put evidence first and drop the steers' },
+  } as never)
+  expect(String(set.result)).toMatch(/problems.*unknown sections in hidden: bogus; waiting stays/)
+  ui = await $.ui.mount({ ...PANE, surface: 'vscode' })
+  expect(await headings(ui)).toEqual(['Evidence', 'Nothing waiting on you'])
+  expect(await ui.find({ type: 'Text', text: /layout: “put evidence first/ })).toBeDefined()
+  expect(JSON.parse(files.get('/nonexistent/.claude/hcp/layout.json')!).current.hidden).toEqual(['steer'])
+
+  await ui.press({ key: 'layout-ask' })
+  await ui.press({ key: 'layout-undo' })
+  await settle()
+  expect(await headings(ui)).toEqual(['Nothing waiting on you', 'Evidence', 'Steer the current run'])
+  await ui.unmount()
+
+  expect(String((await $.tool.call({ tool: 'mcp__hcp__layout', action: 'reset' } as never)).result)).toBe('Back to the default layout.')
 })
