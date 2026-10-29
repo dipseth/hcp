@@ -10,6 +10,7 @@ import { compilePipelineSpec, defineRegistry, hashToUnit, jsonataEngine, z } fro
 import type { CompileResult, Distributions, SpecRegistry } from './vendor/dp.js'
 
 import type { HcpDecision } from '../types'
+import type { InterruptNote } from './reach'
 
 /** The outcomes that say the person wanted a say: asking was right. */
 const NEEDED = new Set<HcpDecision['outcome']>(['overrode', 'no-pick', 'disagreed'])
@@ -46,8 +47,12 @@ export function similarPrecedents(decision: HcpDecision, pool: readonly HcpDecis
     .slice(0, MAX_PRECEDENTS)
 }
 
-/** One state, many atomic questions: one per precedent, and three about the decision itself. */
-export function surfaceFrame(decision: HcpDecision, precedents: readonly HcpDecision[]) {
+/**
+ * One state, many atomic questions: one per precedent, three about the
+ * decision itself, and, when the person stopped or redirected Claude lately,
+ * one that reconciles the decision with what they said then.
+ */
+export function surfaceFrame(decision: HcpDecision, precedents: readonly HcpDecision[], interrupts: readonly InterruptNote[] = []) {
   const questions: Record<string, { type: 'noul'; instructions: string }> = {
     reversible: { type: 'noul', instructions: 'Can the choice in `decision` be undone easily later?' },
     others: {
@@ -59,6 +64,13 @@ export function surfaceFrame(decision: HcpDecision, precedents: readonly HcpDeci
       instructions: 'Are the options in `decision` close enough that a careful person could reasonably pick any of them?',
     },
   }
+  if (interrupts.length > 0) {
+    questions.contested = {
+      type: 'noul',
+      instructions:
+        'The notes in `interrupts` are times the person stopped Claude, or wrote to it mid-run, and what they said. Do they suggest the person would want a say on `decision` before Claude acts on it?',
+    }
+  }
   precedents.forEach((_, at) => {
     questions[`same_kind_${at}`] = {
       type: 'noul',
@@ -66,7 +78,7 @@ export function surfaceFrame(decision: HcpDecision, precedents: readonly HcpDeci
     }
   })
 
-  return { state: { decision: brief(decision), precedents: precedents.map(brief) }, questions }
+  return { state: { decision: brief(decision), precedents: precedents.map(brief), ...(interrupts.length > 0 ? { interrupts } : {}) }, questions }
 }
 
 export type Evidence = {
@@ -85,6 +97,8 @@ export type Evidence = {
   reversible: number
   others: number
   close: number
+  /** How strongly recent redirects suggest the person wants a say: context, not a record of Claude being wrong. 0 with none. */
+  contested: number
   /** A fixed share of decisions is asked whatever the record says, so the record keeps learning. */
   explore: boolean
   matched: string[]
@@ -134,6 +148,7 @@ export function evidenceOf(decision: HcpDecision, items: readonly HcpDecision[],
     reversible: p.reversible?.[0] ?? 0,
     others: p.others?.[0] ?? 1,
     close: p.close?.[0] ?? 0,
+    contested: p.contested?.[0] ?? 0,
     explore: hashToUnit(`${decision.id}:explore`) < t.explore!,
     matched: matched.map(d => d.id),
   }
@@ -171,14 +186,14 @@ export const SURFACE_SPEC = {
   result: ['ask', 'tell', 'log'],
   nodes: {
     precedents: { kind: 'read', call: 'hcp.precedents@1', version: '1' },
-    judge: { kind: 'decide', questions: 'hcp-surface', version: '1' },
+    judge: { kind: 'decide', questions: 'hcp-surface', version: '2' },
     evidence: {
       kind: 'code',
       role: 'transform',
       call: 'hcp.evidence@1',
       args: { items: 'precedents.items', p: 'judge' },
       thresholds: { match: 0.7, explore: 0.1 },
-      version: '2',
+      version: '3',
     },
     gate: {
       kind: 'code',
@@ -186,13 +201,14 @@ export const SURFACE_SPEC = {
       inputs: { e: 'evidence' },
       branches: ['ask', 'tell', 'log'],
       // tell and log read the record's lower bound, not its mean: thin evidence stays asked.
-      thresholds: { min_n: 5, others: 0.5, reversible: 0.5, tell: 0.7, log: 0.85, close: 0.5 },
+      thresholds: { min_n: 5, others: 0.5, reversible: 0.5, tell: 0.7, log: 0.85, close: 0.5, contested: 0.6 },
       rules: [
         { when: 'e.explore', branch: 'ask', reason: "'exploring: asked to keep the record honest'" },
         { when: 'e.n < $t.min_n', branch: 'ask', reason: "'too little precedent: ' & $string(e.n) & ' like it'" },
         { when: 'e.lastNo', branch: 'ask', reason: "'you went another way on the last one like it'" },
         { when: 'e.others >= $t.others', branch: 'ask', reason: "'affects other people'" },
         { when: 'e.reversible < $t.reversible', branch: 'ask', reason: "'hard to undo'" },
+        { when: 'e.contested >= $t.contested', branch: 'ask', reason: "'what you said when you last redirected Claude suggests you want a say'" },
         {
           when: 'e.lower >= $t.log and e.close < $t.close',
           branch: 'log',
@@ -202,7 +218,7 @@ export const SURFACE_SPEC = {
         { when: 'e.lower >= $t.tell', branch: 'tell', reason: "'your record: at least ' & $string($round(e.lower * 100)) & '% kept'", confidence: 'e.lower' },
         { branch: 'ask', reason: "'not enough of a record yet: ' & $string($round(e.rate * 100)) & '% kept on ' & $string(e.n)" },
       ],
-      version: '2',
+      version: '3',
     },
     ask: { kind: 'code', role: 'derive', expr: '{ "verdict": "ask", "reason": $branches.gate.reason, "evidence": gate }', version: '1' },
     tell: { kind: 'code', role: 'derive', expr: '{ "verdict": "tell", "reason": $branches.gate.reason, "evidence": gate }', version: '1' },
@@ -252,7 +268,7 @@ export function hcpRegistry(pool: () => readonly HcpDecision[]): SpecRegistry {
         id: 'hcp.evidence',
         version: '1',
         describe:
-          "The person's record on the precedents Jev matched (`p.same_kind_<i>` ≥ threshold `match`): n, rate (weighted mean), lower (its cautious 5% bound: gate on this), lastNo, reversible, others, close, explore.",
+          "The person's record on the precedents Jev matched (`p.same_kind_<i>` ≥ threshold `match`): n, rate (weighted mean), lower (its cautious 5% bound: gate on this), lastNo, reversible, others, close, contested (recent redirects suggest a say; 0 with none), explore.",
         args: z.object({ items: json, p: json }),
         run: (args: { items: unknown; p: unknown }, ctx: { input: unknown; thresholds: Readonly<Record<string, number>> }) =>
           evidenceOf(ctx.input as HcpDecision, (args.items ?? []) as HcpDecision[], (args.p ?? {}) as Distributions, ctx.thresholds),

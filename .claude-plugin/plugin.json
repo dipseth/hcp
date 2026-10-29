@@ -1,7 +1,7 @@
 {
   "name": "hcp",
-  "version": "0.6.0",
-  "description": "Human Context Protocol: clickable cards, handoffs, no-reply notes, a reach contract that holds calls contacting people for your OK, and an Evidence reel of the links decisions rest on",
+  "version": "0.7.0",
+  "description": "Human Context Protocol: clickable cards, handoffs, no-reply notes, a reach contract that holds calls contacting people for your OK (aligned with your Claude Code permission rules and learning from your answers), steers learned from your interrupts, and an Evidence reel of the links decisions rest on",
   "types": "./types/index.d.ts",
   "userConfig": {
     "typesafe_api_key": {

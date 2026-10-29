@@ -95,7 +95,12 @@ export const redact = (text: string) => text.replace(SECRET, '[redacted]')
 
 const clipTo = (text: string, max: number) => (text.length <= max ? text : `${text.slice(0, max - 1)}…`)
 
-const blankQuotes = (command: string) => command.replace(/'[^']*'|"(?:\\.|[^"\\])*"/g, '""')
+// A heredoc's body is text, not commands: `git commit -F - <<EOF` with "mail" in it is not mail.
+const HEREDOC = /<<-?\s*(['"]?)(\w+)\1[^\n]*\n[\s\S]*?\n\s*\2(?=\s|\)|$)/g
+
+/** The command with heredoc bodies and quoted text blanked: what rules and audiences read. */
+export const blankQuotes = (command: string) =>
+  command.replace(HEREDOC, '<<""').replace(/'[^']*'|"(?:\\.|[^"\\])*"/g, '""')
 
 const flat = (value: unknown): string[] =>
   Array.isArray(value) ? value.flatMap(flat) : value === undefined || value === null || typeof value === 'object' ? [] : [String(value)]
@@ -107,9 +112,12 @@ function mcpParts(tool: string) {
 }
 
 /** `gh issue comment 12 -R dipseth/hcp` → audience `dipseth/hcp#12`; `git push origin main` → `origin main`. */
-function bashAudience(command: string): string[] {
+function bashAudience(raw: string): string[] {
+  // Addresses in a commit message or PR body (Co-Authored-By, an example) are text, not recipients.
+  const command = blankQuotes(raw)
   const out: string[] = []
-  const repo = /(?:-R|--repo)[\s=]+([\w.-]+\/[\w.-]+)/.exec(command)?.[1]
+  const loose = raw.replace(HEREDOC, '').replace(/["']/g, '')
+  const repo = /(?:-R|--repo)[\s=]+([\w.-]+\/[\w.-]+)/.exec(loose)?.[1]
   const issue = /\bgh\s+(?:issue|pr)\s+\w+\s+(\d+|https:\/\/github\.com\/\S+)/.exec(command)?.[1]
   if (issue?.startsWith('https://')) out.push(issue)
   else if (issue) out.push(`${repo ?? 'this repo'}#${issue}`)
@@ -117,7 +125,7 @@ function bashAudience(command: string): string[] {
   const push = /\bgit\s+push\s+(?:-\S+\s+)*([\w./-]+)(?:\s+([\w./:-]+))?/.exec(command)
   if (push) out.push([push[1], push[2]].filter(Boolean).join(' '))
   for (const email of command.match(/[\w.+-]+@[\w-]+\.[\w.]+/g) ?? []) out.push(email)
-  const host = /https?:\/\/([\w.-]+)/.exec(command)?.[1]
+  const host = /https?:\/\/([\w.-]+)/.exec(command)?.[1] ?? /https?:\/\/([\w.-]+)/.exec(raw.replace(HEREDOC, ''))?.[1]
   if (out.length === 0 && host) out.push(host)
 
   return [...new Set(out)]
@@ -255,32 +263,144 @@ export const GRANT_QUESTIONS = {
   },
 } as const
 
-export type ReachInput = { facts: CallFacts; grant?: GrantFacts }
+/**
+ * What Claude Code's own permission check says of this call: the settings
+ * are the person's standing word, so hcp reads them instead of keeping a
+ * second list. `rule` is the settings rule that decided, when one did.
+ */
+export type SettingsVerdict = { decision: 'allow' | 'ask' | 'deny'; rule?: string }
 
-/** What Jev reads: the call, and the grant it might fall under. No tool names beyond the channel. */
+/** The person's past answers on held calls like this one: same channel, same project or repo. */
+export type ReachRecord = {
+  scope: string
+  /** Cards answered Send or allow similar. */
+  sent: number
+  /** Cards answered draft, change, edit or not now: the hold was worth it. */
+  held: number
+  /** The 5% lower bound of the send rate's Beta posterior: gate on this, not the mean. */
+  lower: number
+  /** The newest answer kept the call back: hold the next one. */
+  lastHeld: boolean
+  /** What was sent before, clipped: what the classifier compares this call with. */
+  recent: string[]
+}
+
+/** A time the person stopped Claude, and what they said next: remembered, never scored as a "no". */
+export type InterruptNote = { ago: string; doing: string; said: string }
+
+export type ReachContext = { settings?: SettingsVerdict; record?: ReachRecord; interrupts?: InterruptNote[] }
+
+export type ReachInput = { facts: CallFacts; grant?: GrantFacts; context?: ReachContext }
+
+// Asked only when the record alone would let a call through: is this one like the others?
+export const STANDING_QUESTIONS = {
+  unusual: {
+    type: 'noul',
+    instructions:
+      'Is `call` unlike the calls in `context.recent`, which the person approved before: a different kind of message, new people, or sensitive content such as credentials, personal data, money or commitments?',
+  },
+  stopped_like: {
+    type: 'noul',
+    instructions:
+      'Do the notes in `context.interrupts` (times the person stopped Claude and what they said next) suggest they would want to see `call` before it goes?',
+  },
+} as const
+
+/** Rules a call's record must meet before the classifier is even asked about standing. */
+export const STANDING = { min_n: 5, lower: 0.65 }
+
+/** The record is long and good enough that, with the classifier's agreement, no card is needed. */
+export const recordQualifies = (record: ReachRecord | undefined): record is ReachRecord =>
+  record !== undefined && record.sent + record.held >= STANDING.min_n && record.lower >= STANDING.lower && !record.lastHeld
+
+/** Settings that already decide the call: a rule allows it, asks for it, or refuses it. */
+const settingsDecide = (s: SettingsVerdict | undefined) => s !== undefined && s.rule !== undefined
+
+/** What Jev reads: the call, the grant it might fall under, and the context it reconciles. No tool names beyond the channel. */
 export function judgeState(input: ReachInput) {
-  const { facts, grant } = input
+  const { facts, grant, context } = input
+  const standing = askStanding(input)
 
   return {
     call: { channel: facts.channel, audience: facts.audience, content: facts.content },
     ...(grant ? { grant } : {}),
+    ...(standing ? { context: { recent: context!.record!.recent, interrupts: context!.interrupts ?? [] } } : {}),
   }
 }
 
-/** The questions this call needs: reach when the rules couldn't tell, fit when a grant might cover it. */
+const askStanding = (input: ReachInput) =>
+  input.facts.level === 'notifies' && !settingsDecide(input.context?.settings) && input.grant === undefined && recordQualifies(input.context?.record)
+
+/** The questions this call needs: reach when the rules couldn't tell, fit when a grant might cover it, likeness when the record might. */
 export function questionsFor(input: ReachInput) {
+  if (settingsDecide(input.context?.settings)) return {}
+
   return {
     ...(input.facts.source === 'none' ? REACH_QUESTIONS : {}),
     ...(input.grant ? GRANT_QUESTIONS : {}),
+    ...(askStanding(input) ? STANDING_QUESTIONS : {}),
   }
 }
 
 // Tuned on tests/fixtures/reach-calls.json with build/calibrate.ts (jev-1.14.0); see the README.
 export const LEVEL_THRESHOLDS = { notifies: 0.5, person: 0.6, visible: 0.6, remote: 0.5 }
-export const GATE_THRESHOLDS = { same_kind: 0.7, same_audience: 0.8, sensitive: 0.4 }
+export const GATE_THRESHOLDS = { same_kind: 0.7, same_audience: 0.8, sensitive: 0.4, unusual: 0.5, stopped_like: 0.5 }
+
+/** How much one answer counts in a record: keeping a call back outweighs sending one. */
+export const ANSWER_WEIGHT: Record<string, { sent?: number; held?: number }> = {
+  send: { sent: 1 },
+  'similar-1h': { sent: 1 },
+  'similar-day': { sent: 1 },
+  always: { sent: 2 },
+  edit: { held: 1 },
+  change: { held: 2 },
+  draft: { held: 2 },
+  'not-now': { held: 2 },
+  // A standing call the person said should have been held after all.
+  'hold-again': { held: 3 },
+}
+
+/** The 5% lower bound of Beta(a, b), by its normal approximation. */
+export function betaLowerOf(a: number, b: number): number {
+  const n = a + b
+  const sd = Math.sqrt((a * b) / (n * n * (n + 1)))
+
+  return Math.max(0, Math.round((a / n - 1.645 * sd) * 1000) / 1000)
+}
+
+/** A ledger row of the person's answer on a held or standing call. */
+export type AnswerRow = { at: number; channel: string; scope?: string; label: string; content?: string }
+
+/**
+ * The record for one channel in one scope. Rows from before scopes were kept
+ * count wherever the channel matches: they are still the person's answers.
+ */
+export function recordOf(rows: readonly AnswerRow[], channel: string, scope: string): ReachRecord {
+  const like = rows.filter(r => r.channel === channel && (r.scope === undefined || r.scope === scope)).sort((a, b) => a.at - b.at)
+  let sent = 0
+  let held = 0
+  for (const r of like) {
+    sent += ANSWER_WEIGHT[r.label]?.sent ?? 0
+    held += ANSWER_WEIGHT[r.label]?.held ?? 0
+  }
+  const last = like[like.length - 1]
+  const recent = like
+    .filter(r => (ANSWER_WEIGHT[r.label]?.sent ?? 0) > 0 && r.content)
+    .slice(-3)
+    .map(r => r.content!.slice(0, 400))
+
+  return { scope, sent, held, lower: betaLowerOf(sent + 1, held + 1), lastHeld: last !== undefined && (ANSWER_WEIGHT[last.label]?.held ?? 0) > 0, recent }
+}
+
+/** Where a record is kept: the repo the call names, else the project hcp runs in. */
+export function scopeOf(facts: CallFacts, project: string | undefined): string {
+  const repo = facts.audience.map(a => /^([\w.-]+\/[\w.-]+)(#|$)/.exec(a)?.[1]).find(Boolean)
+
+  return repo ?? project ?? 'any'
+}
 
 export type ReachVerdict = {
-  branch: 'pass' | 'badge' | 'grant' | 'hold'
+  branch: 'pass' | 'badge' | 'standing' | 'grant' | 'hold'
   /** Undefined when the rules couldn't tell and no judge answered. */
   level?: ReachLevel
   reason: string
@@ -309,11 +429,34 @@ export function levelOf(facts: CallFacts, d: Distributions, t: Record<string, nu
   return { level: 'local', reason: `${facts.why}; judged local` }
 }
 
-/** Pass, badge, grant or hold, from the level and how well the call fits a grant. */
-export function gateOf(level: ReachLevel | undefined, d: Distributions, hasGrant: boolean, t: Record<string, number>) {
+/**
+ * Pass, badge, standing, grant or hold: from the level, the person's
+ * settings, how well the call fits a grant, and their record on like calls.
+ */
+export function gateOf(level: ReachLevel | undefined, d: Distributions, hasGrant: boolean, t: Record<string, number>, context: ReachContext = {}) {
   if (level === 'local' || level === 'own') return { branch: 'pass' as const, reason: `${level}: nothing to show` }
   if (level === undefined || level === 'shared') return { branch: 'badge' as const, reason: level ? 'others can see it' : 'reach unknown' }
-  if (!hasGrant) return { branch: 'hold' as const, reason: 'notifies people, no grant covers it' }
+  const { settings, record } = context
+  // The settings are the person's word already given: hcp doesn't ask a second time.
+  if (settings?.rule !== undefined) {
+    if (settings.decision === 'allow') return { branch: 'standing' as const, reason: `your Claude Code settings allow it (${settings.rule})` }
+    if (settings.decision === 'ask') return { branch: 'badge' as const, reason: `your settings ask for it (${settings.rule}): Claude Code's own prompt decides` }
+
+    return { branch: 'pass' as const, reason: `your settings refuse it (${settings.rule})` }
+  }
+  if (!hasGrant) {
+    if (recordQualifies(record)) {
+      const unusual = p1(d, 'unusual') ?? 1
+      const stopped = p1(d, 'stopped_like') ?? 1
+      const said = `you sent ${record.sent} of ${record.sent + record.held} like it in ${record.scope}`
+      if (unusual < t.unusual! && stopped < t.stopped_like!) return { branch: 'standing' as const, reason: said, confidence: record.lower }
+      const misses = [unusual >= t.unusual! ? 'this one looks different' : '', stopped >= t.stopped_like! ? 'a recent interrupt suggests you want to see it' : ''].filter(Boolean)
+
+      return { branch: 'hold' as const, reason: `${said}, but ${misses.join(' and ')}` }
+    }
+
+    return { branch: 'hold' as const, reason: 'notifies people, no grant covers it' }
+  }
   const kind = p1(d, 'same_kind') ?? 0
   const audience = p1(d, 'same_audience') ?? 0
   const sensitive = p1(d, 'sensitive') ?? 1
@@ -345,7 +488,9 @@ const verdict = (branch: ReachVerdict['branch']) => (args: NodeRunArgs) => {
 
 /**
  * The reach pipeline: judge (Jev, or nothing to ask) → level (code) → gate
- * (code) → one verdict node per branch. A card's answer is the feedback: it
+ * (code) → one verdict node per branch. The gate reads the person's Claude
+ * Code settings verdict and their record on like calls; Jev reconciles the
+ * record with this call and with recent interrupts before it stands in. A card's answer is the feedback: it
  * lands on the gate, so the thresholds can be re-tuned from the records alone.
  */
 export const reachPipeline = definePipeline({
@@ -356,9 +501,9 @@ export const reachPipeline = definePipeline({
   output: z.unknown(),
   trigger: ['on-demand'],
   group: (input: ReachInput) => `channel-${input.facts.channel}`,
-  result: ['pass', 'badge', 'grant', 'hold'],
+  result: ['pass', 'badge', 'standing', 'grant', 'hold'],
   nodes: {
-    judge: { kind: 'decide', questions: 'hcp-reach', version: '2' },
+    judge: { kind: 'decide', questions: 'hcp-reach', version: '3' },
     level: {
       kind: 'code',
       role: 'transform',
@@ -373,17 +518,20 @@ export const reachPipeline = definePipeline({
     gate: {
       kind: 'code',
       role: 'gate',
-      branches: ['pass', 'badge', 'grant', 'hold'],
+      branches: ['pass', 'badge', 'standing', 'grant', 'hold'],
       thresholds: GATE_THRESHOLDS,
       run: (args: NodeRunArgs) => {
         const { level, d } = args.primary as { level?: ReachLevel; d: Distributions }
 
-        return gateOf(level, d, (args.input as ReachInput).grant !== undefined, args.thresholds)
+        const input = args.input as ReachInput
+
+        return gateOf(level, d, input.grant !== undefined, args.thresholds, input.context)
       },
-      version: '2',
+      version: '3',
     },
     pass: { kind: 'code', role: 'derive', run: verdict('pass'), version: '1' },
     badge: { kind: 'code', role: 'derive', run: verdict('badge'), version: '1' },
+    standing: { kind: 'code', role: 'derive', run: verdict('standing'), version: '1' },
     grant: { kind: 'code', role: 'derive', run: verdict('grant'), version: '1' },
     hold: { kind: 'code', role: 'derive', run: verdict('hold'), version: '1' },
   },
@@ -392,6 +540,7 @@ export const reachPipeline = definePipeline({
     { from: 'level', to: 'gate' },
     { from: 'gate', to: 'pass', when: { gate: 'gate', branch: 'pass' } },
     { from: 'gate', to: 'badge', when: { gate: 'gate', branch: 'badge' } },
+    { from: 'gate', to: 'standing', when: { gate: 'gate', branch: 'standing' } },
     { from: 'gate', to: 'grant', when: { gate: 'gate', branch: 'grant' } },
     { from: 'gate', to: 'hold', when: { gate: 'gate', branch: 'hold' } },
   ],
@@ -399,6 +548,17 @@ export const reachPipeline = definePipeline({
     {
       id: 'reach-card',
       from: 'surface:reach-card',
+      to: 'gate',
+      source: 'explicit',
+      scope: 'user',
+      form: 'score',
+      latency: 'deferred',
+      score: { name: 'hold_needed', dataType: 'BOOLEAN' },
+    },
+    // "Hold these again" on a standing call's badge: letting it through was wrong.
+    {
+      id: 'standing-undo',
+      from: 'surface:reach-badge',
       to: 'gate',
       source: 'explicit',
       scope: 'user',

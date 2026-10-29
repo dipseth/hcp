@@ -23,14 +23,15 @@ Any card can carry **`links`**: the PR, issue, CI run, deploy, doc or thread the
   - **Heads-down**: batch questions into one card, keep updates to a line, decide reversible things without asking.
   - **Away**: don't wait on you. Take safe, reversible defaults, leave questions as cards, and make no outward-facing writes (issues, PRs, Slack, deploys) until you're back.
 - **Concise** toggle.
-- **Steers** sent mid-run: Don't code yet, Check with me first, Narrow scope, Wrap up.
+- **Steers** sent mid-run, learned per project from the times you stopped or redirected Claude there (see Interrupts and steers). A project without enough history gets the defaults: Don't code yet, Check with me first, Narrow scope, Wrap up.
 - **Quick replies:** Yes, No, Yes · NNTR, No · NNTR, 👀 Seen.
 - **Message field** with Send / NNTR / Later.
 
 **Pictures:**
 
 - Claude passes `media` (image paths with captions, or a video) on any card. Up to 4 draw as a grid, more as **slides** with ‹ › and a note per slide that goes back with the answer. A video is sampled into 8 frames (ffmpeg), and **▶ Play** opens the original. Thumbnails are made with `sips` under `$TMPDIR/hcp-media/<session>/`.
-- The terminal draws them with its native image support (kitty, Ghostty, iTerm2 3.5+; elsewhere the caption shows, with **⤢ Open**). Desktop, VS Code and mobile draw them as an SVG thumbnail.
+- The terminal draws them with its native image support (kitty, Ghostty, iTerm2 3.5+; elsewhere the caption shows). Desktop, VS Code and mobile draw them as an SVG thumbnail.
+- **⤢ Full size** under every picture (cards, your attachments, **You sent**) opens the original: in VS Code, in the editor's own image viewer (the `code` CLI, else the app by name); elsewhere in the system viewer. The thumbnail itself can't take a click: on these surfaces only a button can, and a button holds text.
 - **To send Claude a picture**, drop an image or video file into the message field (or type its path) and press Enter. It's attached with a thumbnail, then sent with your next message as paths Claude reads. A path in a card's note is attached the same way. Pictures you paste into the normal prompt box also show under **You sent**.
 
 **Keys** (terminal; focus the pane with ctrl+x tab or `/hcp`, and Tab off a text field first): `j`/`k` next/previous card · `1`–`8` pick an option · `s` send/copy/done · `x` dismiss · `h`/`l` previous/next slide · `o` open · `y`/`n` quick Yes/No. New cards never take the focus.
@@ -65,22 +66,25 @@ To change it, press the quiet **✎ layout** at the bottom of the pane and say w
 
 Every tool call is sorted by who it reaches: **local** (this machine), **own** (your accounts, nobody told), **shared** (others can see it), **notifies** (a person gets a message).
 
+- **Your Claude Code settings come first.** Before anything is held, hcp asks Claude Code's own permission check (`$.tool.check`) what your settings say of the call. A rule that allows it (`Bash(gh issue *)` in your allow list) lets it through with no card. A rule that asks leaves it to Claude Code's own prompt, so you're never asked twice. Only a rule counts: the permission mode and the auto-mode classifier are not your word on that call.
 - **notifies** calls are held. The call fails for Claude with "[hcp] Held … card r<n>", and a reach card shows the exact content and who it goes to. You can answer:
-  - **Send**: Claude makes the same call again. That exact call runs once, and Claude Code doesn't ask permission a second time. A message can't be unsent, so the first press says who gets it and the second press sends.
+  - **Send**: Claude makes the same call again. That exact call runs once, and Claude Code doesn't ask permission a second time. A message can't be unsent, so the first press says who gets it and the second press sends, unless you've sent calls like it here before and kept none back: then one press sends.
   - **Send · allow similar 1h** or **… for today**: also opens a grant.
+  - **Always here · `Bash(gh pr create *)`**: adds that permission rule to the project's `.claude/settings.local.json` (personal, not committed). Claude Code and hcp then both let calls like it through: one standing word, read by both.
   - **Save as draft**.
   - **Not now**.
   - **Edit** the content in place and press Enter (twice, as with Send): Claude makes the call with your text, and it runs without another card if the content matches.
   - Or tell Claude what to change.
 - **shared** calls run with a badge on the tool row, for example `↗ git push · origin main · others can see`. **local** and **own** calls run untouched.
+- **Your record stands in for a card.** Each answer is kept against its channel and scope (the repo the call names, else the project). Once you've answered at least 5 like calls and the cautious lower bound of your send rate is 0.65 or more (5 sends and nothing kept back gets there), and your last answer wasn't a keep, the next like call goes through with a "no card: you sent 5 of 5 like it in dipseth/hcp" badge. Jev reconciles it first: is this call unlike the ones you sent, or carrying sensitive content? Do your recent interrupts suggest you'd want to see it? Either one holds it. **↺ card next time** on the badge counts as a strong keep (three times a Send), so like calls get a card again. Draft, change, edit and not now count against the record; with no judge answering, the record never lets a call through.
 - **A grant** lets later calls through without a card, until it expires. A call qualifies only when it uses the same channel (`gh issue comment`), reaches nobody outside the grant's audience, and the judge finds it the same kind of message with no new sensitive material. Anything less gets a card. The pane lists grants with a countdown and **Revoke**, and lists everything outward this session.
 - **Claude reads the contract first.** The protocol and the descriptions of tools that notify people say so, so Claude makes the call and lets hcp ask, instead of asking twice.
 
 How a call is sorted is a [decision pipeline](https://github.com/dipseth/decision-pipeline) (`hooks/reach.ts`): models estimate, code decides, your answers correct it later.
 
-1. **Rules and your tags settle most calls with no network.** Examples: Read and Edit are local; `gh issue|pr comment`, mail and chat webhooks notify; `git push` is shared; an MCP tool named `send_*`, or one that sets an assignee, notifies.
+1. **Rules and your tags settle most calls with no network.** Examples: Read and Edit are local; `gh issue|pr comment`, mail and chat webhooks notify; `git push` is shared; an MCP tool named `send_*`, or one that sets an assignee, notifies. Quoted text and heredoc bodies are text, not commands: a commit message that says "mail", or its `Co-Authored-By` address, is neither a mail command nor an audience.
 2. **Jev judges what the rules can't place**: an untagged MCP write, `curl -X POST`, `gh api -X`. It's one request of four yes/no questions, taking about 200 ms and costing about $0.00002. If Jev fails, the session's haiku answers the same questions. If nobody answers, the call is badged "reach unknown", not held.
-3. **A code gate turns the probabilities into pass, badge, grant or hold.** The thresholds are data, recorded on every run.
+3. **A code gate turns the probabilities into pass, badge, standing, grant or hold**, reading your settings verdict and your record. The thresholds are data, recorded on every run.
 4. **Each card answer is feedback on the gate.** Run records and answers go to `~/.claude/hcp/ledger/<date>.jsonl`, so the thresholds can be re-tuned from the records alone.
 
 The Jev key is `HCP_TYPESAFE_API_KEY`. hcp looks for it in the session's environment first, then the plugin's settings (`typesafe_api_key`), then its line in `~/.claude/.env`. It never appears on a card, in a prompt or in the ledger. Token-like strings are redacted before anything goes to Jev, and Jev sees only the channel, the audience and the content.
@@ -100,10 +104,21 @@ Which choices should reach you at all? Today Claude decides that from prose. hcp
   - **ask**: a card before Claude acts;
   - **tell**: Claude acts, and you get a card to override;
   - **log**: recorded only.
+- **Interrupts are context, not verdicts.** When you've stopped or redirected Claude lately in this project, Jev also reads those notes and answers whether they suggest you'd want a say on this decision; if so, it's asked. An interrupt never counts in the record as Claude getting something wrong.
 - **New ideas get a way in.** With fewer than 5 precedents, the verdict is ask, and so it is when you went another way on the newest one like it. A fixed 10% of decisions are asked anyway, chosen deterministically, so the record keeps learning.
 - **A floor no pipeline can lower.** A decision Claude marks `reversible: false` or `reach: shared|notifies` is asked whatever the champion or any challenger says. The floor is code outside the specs (`floorOf` in `hooks/surface.ts`), and the shadow record keeps what the pipeline wanted beside it.
 - **Watching for rubber stamps.** Every answer records how long it took. `/hcp shadow` lists per kind: answers, median time, the share under 3 seconds, how often you kept Claude's call, and how many Fines were later reversed. It flags a kind where almost every answer is fast and agrees. The random 5% of ask cards with the recommendation hidden measure how much preselection sways you: the report compares how often you match Claude with and without it.
 - **It changes nothing yet.** The verdict is recorded beside what you actually did, and your answer scores it: was asking needed? `/hcp shadow` shows how often it would have been right, how many cards it would have saved, and how often it would have skipped asking when you wanted a say. It earns control only through a pre-registered trial.
+
+## Interrupts and steers
+
+What you type right after stopping Claude, or while it works, is the clearest signal hcp gets of what a project needs. hcp keeps each one in `~/.claude/hcp/interrupts/<date>.jsonl`: when, the project, Claude's last words and calls (the calls Claude made, not a judgment of them), and what you said, redacted. `node build/backfill-interrupts.ts` reads your past transcripts for the same moments into `interrupts/backfill.jsonl`, so a project starts with its history.
+
+They feed three things:
+
+- **The reach and surface classifiers** read the project's newest notes as context (see above). Nothing is scored against Claude.
+- **Steers per project.** The `hcp-steers` pipeline (`hooks/steers.ts`): haiku reads the project's last 40 redirects and drafts up to 6 one-click steers, each with the redirects it would have covered; code ranks them by how many recent redirects they cover and how often you've pressed them, drops one-offs, keeps the top 4, and fills with the defaults. It runs in the background at session start once a project has 3 redirects with words, and again after every 3 new ones; the set is kept in `~/.claude/hcp/steers/<project>.json`. The pane says when a set is learned.
+- **Feedback on the steers.** A press is a `steer_used` score on the run that built the set. When you type a redirect, Jev checks it against the buttons on offer; one you could have pressed is a `steer_missed` score, a sign the label needs work.
 
 ## Pipelines Claude writes
 
@@ -119,7 +134,9 @@ There are two scopes:
 
 ## Observability
 
-With `HCP_LANGFUSE_PUBLIC_KEY`, `HCP_LANGFUSE_SECRET_KEY` and `HCP_LANGFUSE_BASE_URL` set (in the environment, the plugin's settings or `~/.claude/.env`), every run, whether reach, surface or one Claude wrote, is a Langfuse trace with a span per node. Every card answer is a score on that trace (`hold_needed`, `surfaced_right`). Langfuse is best effort: the local ledger keeps everything regardless.
+With `HCP_LANGFUSE_PUBLIC_KEY`, `HCP_LANGFUSE_SECRET_KEY` and `HCP_LANGFUSE_BASE_URL` set (in the environment, the plugin's settings or `~/.claude/.env`), every run, whether reach, surface, steers or one Claude wrote, is a Langfuse trace with a span per node. Every card answer is a score on that trace's root observation (`hold_needed`, `surfaced_right`, `steer_used`). Langfuse is best effort: the local ledger keeps everything regardless.
+
+Traces use Langfuse's v4 (observations-first) ingestion: OTLP/HTTP JSON to `/api/public/otel/v1/traces` with `x-langfuse-ingestion-version: 4`, not the legacy `/api/public/ingestion`. Each run is built in memory and sent once when it ends, as complete spans: the root (`chain`) carries the run's input and output, decide and generate nodes are `generation`s with their cost, the rest `span`s, and the trace name, session (the pipeline's group), tags and user are copied onto every span so each observation filters alike. The root span's id is the first 16 hex of the trace id, which is how a score written later targets it. Scores go to `POST /api/public/scores`, which v4 keeps. Delivery is as before: one request per run in the background, no retries, failures dropped (the ledger has the run).
 
 ### Keys on every host
 

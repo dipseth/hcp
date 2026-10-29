@@ -7,6 +7,7 @@
 import type { EngineInterface } from 'claude-code'
 
 import type { HcpDecision } from '../types'
+import type { InterruptNote } from './reach'
 import { appendJsonl, appendLedger, decidePort, generatePort, ROUTES, scoresPort, tracerFor } from './ports'
 import type { Frame, Judge, Judged, Route } from './ports'
 import { SURFACE_SPEC, compileSpec, hcpRegistry, surfaceFrame, surfacedRight, withFloor } from './surface'
@@ -31,9 +32,15 @@ type Loaded = SavedPipeline & { pipeline: Pipeline }
 /** Decisions from earlier sessions, newest state per id; this session's live in $.state. */
 let history: HcpDecision[] = []
 let sessionDecisions: () => readonly HcpDecision[] = () => []
+let recentInterrupts: () => readonly InterruptNote[] = () => []
 const registry = hcpRegistry(() => [...history, ...sessionDecisions()])
 const champion = compileSpec(SURFACE_SPEC, registry).pipeline!
 const saved = new Map<string, Loaded>()
+
+/** Where the surface frame reads the project's recent interrupts from. */
+export function bindInterrupts(read: () => readonly InterruptNote[]) {
+  recentInterrupts = read
+}
 
 /** How the module reads this session's decisions without importing the atom. */
 export function bindSession(read: () => readonly HcpDecision[]) {
@@ -88,7 +95,7 @@ const specFrame =
     if (request.questions === 'hcp-surface') {
       const items = ((request.from.precedents as { items?: HcpDecision[] } | undefined)?.items ?? []) as HcpDecision[]
 
-      return surfaceFrame(request.input as HcpDecision, items)
+      return surfaceFrame(request.input as HcpDecision, items, recentInterrupts())
     }
 
     return { state: { input: request.input, from: request.from }, questions: questions[request.questions ?? ''] ?? {} }

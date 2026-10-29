@@ -2,7 +2,9 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 
 import { harvestLinks, kindOf, parseTypedLink } from '../hooks/evidence'
-import { callKey, classifyCall, gateOf, parseTags, redact } from '../hooks/reach'
+import { callKey, classifyCall, gateOf, parseTags, recordOf, redact } from '../hooks/reach'
+import { DEFAULT_STEERS, needsBuild, notesFor, rankSteers, saidOf, withDefaults } from '../hooks/steers'
+import { ruleFor } from '../hooks/memory'
 import { SURFACE_SPEC, betaLower, evidenceOf, similarPrecedents, withFloor } from '../hooks/surface'
 import {
   detectService,
@@ -851,7 +853,7 @@ test('Claude writes a pipeline: problems come back to fix, a good one is saved, 
   expect(shadows).toEqual(['hcp-surface', 'hcp-surface-strict'])
 })
 
-test('with Langfuse set, a run is a trace with a span per node, and the card answer is a score on that trace', async ($, on) => {
+test('with Langfuse set, a run is one v4 OTLP trace with a span per node, and the card answer is a score on its root observation', async ($, on) => {
   engine(on, {
     ...KEYED,
     HCP_LANGFUSE_PUBLIC_KEY: 'pk-lf-1',
@@ -860,29 +862,58 @@ test('with Langfuse set, a run is a trace with a span per node, and the card ans
   })
   tools(on)
   ledger(on)
-  const posts: { url: string; auth: string; body: Record<string, unknown> }[] = []
+  const posts: { url: string; headers: Record<string, string>; body: Record<string, unknown> }[] = []
   on('http.fetch', (_, e) => {
-    posts.push({ url: e.url, auth: e.init?.headers?.authorization ?? '', body: JSON.parse(e.init?.body ?? '{}') as Record<string, unknown> })
+    posts.push({ url: e.url, headers: { ...(e.init?.headers ?? {}) }, body: JSON.parse(e.init?.body ?? '{}') as Record<string, unknown> })
 
-    return { value: { status: 207, ok: true, headers: {}, text: '{}' } }
+    return { value: { status: 200, ok: true, headers: {}, text: '{}' } }
   })
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await $.tool.call({ tool: 'Bash', command: COMMENT })
   await settle()
 
-  const batch = posts.find(p => p.url === 'https://lf.example.com/api/public/ingestion')!
-  expect(batch.auth).toBe('Basic cGstbGYtMTpzay1sZi0x') // base64("pk-lf-1:sk-lf-1")
-  const events = batch.body.batch as { type: string; body: { id: string; traceId?: string; name: string; tags?: string[] } }[]
-  expect(events[0]).toMatchObject({ type: 'trace-create', body: { name: 'pipeline:hcp-reach', tags: expect.arrayContaining(['hcp', 'reach']) } })
-  const traceId = events[0]!.body.id
-  expect(events.filter(ev => ev.type === 'span-create').every(ev => ev.body.traceId === traceId)).toBe(true)
+  expect(posts.some(p => p.url.endsWith('/api/public/ingestion'))).toBe(false)
+  const otel = posts.find(p => p.url === 'https://lf.example.com/api/public/otel/v1/traces')!
+  expect(otel.headers.authorization).toBe('Basic cGstbGYtMTpzay1sZi0x') // base64("pk-lf-1:sk-lf-1")
+  expect(otel.headers['x-langfuse-ingestion-version']).toBe('4')
+  type Span = {
+    traceId: string
+    spanId: string
+    parentSpanId?: string
+    name: string
+    startTimeUnixNano: string
+    endTimeUnixNano: string
+    attributes: { key: string; value: { stringValue?: string; arrayValue?: { values: { stringValue: string }[] } } }[]
+  }
+  const spans = (otel.body as { resourceSpans: { scopeSpans: { spans: Span[] }[] }[] }).resourceSpans[0]!.scopeSpans[0]!.spans
+  const value = (s: Span, key: string) => s.attributes.find(a => a.key === key)?.value
+  const [root, ...nodes] = spans
+  expect(root!.name).toBe('pipeline:hcp-reach')
+  expect(root!.parentSpanId).toBe(undefined)
+  expect(root!.traceId).toMatch(/^[0-9a-f]{32}$/)
+  expect(root!.spanId).toBe(root!.traceId.slice(0, 16))
+  expect(value(root!, 'langfuse.observation.input')).toBeDefined()
+  expect(value(root!, 'langfuse.observation.output')).toBeDefined()
+  expect(nodes.length).toBeGreaterThan(0)
+  for (const span of spans) {
+    expect(span.traceId).toBe(root!.traceId)
+    expect(span.spanId).toMatch(/^[0-9a-f]{16}$/)
+    expect(Number(span.endTimeUnixNano)).toBeGreaterThanOrEqual(Number(span.startTimeUnixNano))
+    // Trace-wide context is on every observation, so each one filters alike.
+    expect(value(span, 'langfuse.trace.name')?.stringValue).toBe('pipeline:hcp-reach')
+    expect(value(span, 'langfuse.session.id')?.stringValue).toMatch(/^channel-/)
+    expect(value(span, 'langfuse.trace.tags')?.arrayValue?.values.map(v => v.stringValue)).toEqual(expect.arrayContaining(['hcp', 'reach']))
+  }
+  expect(nodes.every(n => n.parentSpanId === root!.spanId)).toBe(true)
+  // Each span is sent once: one request per run.
+  expect(posts.filter(p => p.url.endsWith('/otel/v1/traces')).length).toBe(1)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'r1-not-now' })
   await settle()
   await ui.unmount()
   const score = posts.find(p => p.url === 'https://lf.example.com/api/public/scores')!
-  expect(score.body).toMatchObject({ traceId, name: 'hold_needed', value: 1, dataType: 'BOOLEAN' })
+  expect(score.body).toMatchObject({ traceId: root!.traceId, observationId: root!.spanId, name: 'hold_needed', value: 1, dataType: 'BOOLEAN', comment: 'not-now' })
 })
 
 test('with no environment, the Jev key comes from the plugin settings', { options: { typesafe_api_key: 'apikey_FROMCONFIG' } }, async ($, on) => {
@@ -912,7 +943,7 @@ test(
     await $.tool.call({ tool: 'Bash', command: COMMENT })
     await settle()
 
-    const batch = posts.find(p => p.url === 'https://lf.example.com/api/public/ingestion')
+    const batch = posts.find(p => p.url === 'https://lf.example.com/api/public/otel/v1/traces')
     expect(batch?.auth).toBe('Basic cGstY2ZnOnNrLWVudg==') // base64("pk-cfg:sk-env")
   },
 )
@@ -1255,4 +1286,199 @@ test('the pane follows a layout spec: evidence under the waiting cards by defaul
   await ui.unmount()
 
   expect(String((await $.tool.call({ tool: 'mcp__hcp__layout', action: 'reset' } as never)).result)).toBe('Back to the default layout.')
+})
+
+/** Lists the in-memory files under a folder, as the host's fs.list would. */
+function listing(on: On, files: Map<string, string>) {
+  on('fs.list', (_, e) => ({
+    value: [...files.keys()]
+      .filter(path => path.startsWith(`${e.path}/`) && !path.slice(e.path.length + 1).includes('/'))
+      .map(path => ({ name: path.slice(e.path.length + 1), kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })),
+  }))
+}
+
+const COMMIT = `git commit -F - <<'EOF'
+Send mail to the list when the job ends
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+EOF`
+
+test('a heredoc body is text: a commit message saying mail is not mail, and its addresses are not an audience', () => {
+  expect(classifyCall('Bash', { command: COMMIT }).level).toBe('local')
+  expect(classifyCall('Bash', { command: `${COMMIT}\ngit push origin main` })).toMatchObject({ level: 'shared', audience: ['origin main'] })
+  const pr = classifyCall('Bash', { command: 'gh pr create -R "dipseth/hcp" --body "ping someone@example.com"' })
+  expect(pr).toMatchObject({ level: 'notifies', audience: ['dipseth/hcp'] })
+  expect(ruleFor(pr)).toBe('Bash(gh pr create *)')
+  expect(ruleFor({ tool: 'Bash', channel: 'mail' })).toBe(undefined)
+  expect(ruleFor({ tool: 'mcp__claude_ai_weReci__send_recipe_email', channel: 'weReci send_recipe_email' })).toBe('mcp__claude_ai_weReci__send_recipe_email')
+})
+
+test("the gate takes the person's settings as their word, and lets a call stand on a long clean record the classifier agrees with", () => {
+  const t = { same_kind: 0.7, same_audience: 0.8, sensitive: 0.4, unusual: 0.5, stopped_like: 0.5 }
+  expect(gateOf('notifies', {}, false, t, { settings: { decision: 'allow', rule: 'Bash(gh issue *)' } })).toMatchObject({ branch: 'standing' })
+  expect(gateOf('notifies', {}, false, t, { settings: { decision: 'ask', rule: 'Bash(gh pr *)' } }).branch).toBe('badge')
+  const rows = (labels: string[]) => labels.map((label, at) => ({ at, channel: 'gh pr create', scope: 'dipseth/hcp', label, content: 'gh pr create' }))
+  const clean = recordOf(rows(['send', 'send', 'similar-1h', 'send', 'send']), 'gh pr create', 'dipseth/hcp')
+  expect(clean).toMatchObject({ sent: 5, held: 0, lastHeld: false })
+  expect(clean.lower).toBeGreaterThanOrEqual(0.65)
+  expect(gateOf('notifies', { unusual: [0.1], stopped_like: [0.1] }, false, t, { record: clean })).toMatchObject({
+    branch: 'standing',
+    reason: expect.stringContaining('you sent 5 of 5'),
+  })
+  expect(gateOf('notifies', { unusual: [0.8], stopped_like: [0.1] }, false, t, { record: clean }).reason).toContain('this one looks different')
+  // No judge answered: the record alone never lets a call through.
+  expect(gateOf('notifies', {}, false, t, { record: clean }).branch).toBe('hold')
+  expect(recordOf(rows(['send', 'send', 'send', 'send', 'send', 'draft']), 'gh pr create', 'dipseth/hcp').lastHeld).toBe(true)
+  expect(recordOf(rows(['send', 'send', 'send', 'send']), 'gh pr create', 'dipseth/hcp').lower).toBeLessThan(0.65)
+  // Another repo is another record; rows from before scopes count everywhere.
+  expect(recordOf([...rows(['send']), { at: 9, channel: 'gh pr create', label: 'send' }], 'gh pr create', 'other/repo').sent).toBe(1)
+})
+
+test('a settings rule that allows the command lets it through with no card and no judge', async ($, on) => {
+  engine(on, KEYED)
+  const ran = tools(on)
+  const sent = jev(on, {})
+  ledger(on)
+  on('tool.check', () => ({ decision: 'allow' as const, rule: 'Bash(gh issue *)' }))
+  await $.session.start({ cwd: '/work/hcp', surface: 'vscode', isInteractive: true })
+  expect((await $.tool.call({ tool: 'Bash', command: COMMENT })).deny).toBe(undefined)
+  expect(ran).toEqual([COMMENT])
+  expect(sent.length).toBe(0)
+  const ui = await $.ui.mount({ ...PANE, surface: 'vscode' })
+  expect(await ui.find({ type: 'Text', text: /no card: your Claude Code settings allow it \(Bash\(gh issue \*\)\)/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('five clean sends here let the next like call stand, one press undoes that, and a familiar card sends on one press', async ($, on) => {
+  engine(on, KEYED)
+  const ran = tools(on)
+  const files = ledger(on)
+  listing(on, files)
+  const day = '/home/me/.claude/hcp/ledger/2026-10-21.jsonl'
+  const sends = [1, 2, 3, 4, 5].map(at =>
+    JSON.stringify({ at, type: 'score', channel: 'gh issue comment', scope: 'dipseth/hcp', name: 'hold_needed', value: 0, label: 'send', content: 'thanks' }),
+  )
+  files.set(day, `${sends.join('\n')}\n`)
+  const bodies = jevBy(on, () => 0.1)
+  await $.session.start({ cwd: '/work/hcp', surface: 'vscode', isInteractive: true })
+
+  expect((await $.tool.call({ tool: 'Bash', command: COMMENT })).deny).toBe(undefined)
+  expect(Object.keys(bodies[0]!.questions as object).sort()).toEqual(['stopped_like', 'unusual'])
+  expect((bodies[0]!.state as { context: { recent: string[] } }).context.recent).toEqual(['thanks', 'thanks', 'thanks'])
+  const ui = await $.ui.mount({ ...PANE, surface: 'vscode' })
+  expect(await ui.find({ type: 'Text', text: /no card: you sent 5 of 5 like it in dipseth\/hcp/ })).toBeDefined()
+  const undo = (await ui.findAll({ type: 'Button' })).find(b => b.props.label === '↺ card next time')
+  await ui.press({ key: undo!.key! })
+  await settle()
+
+  // Undone: the next one is held.
+  expect((await $.tool.call({ tool: 'Bash', command: COMMENT })).deny).toMatch(/Card r1 is up/)
+  // The person just asked for cards here: Send asks to be pressed twice again.
+  await ui.press({ key: 'r1-send' })
+  expect(await ui.find({ type: 'Text', text: /Press again/ })).toBeDefined()
+  expect(ran).toEqual([COMMENT])
+  await ui.unmount()
+})
+
+test('a held call the person has sent like before, keeping none back, sends on one press', async ($, on) => {
+  const submitted = engine(on, KEYED)
+  tools(on)
+  jev(on, {})
+  const files = ledger(on)
+  listing(on, files)
+  const sends = [1, 2, 3].map(at => JSON.stringify({ at, type: 'score', channel: 'gh issue comment', name: 'hold_needed', value: 0, label: 'send' }))
+  files.set('/home/me/.claude/hcp/ledger/2026-10-21.jsonl', `${sends.join('\n')}\n`)
+  await $.session.start({ cwd: '/work/hcp', surface: 'vscode', isInteractive: true })
+  // Three sends: too few to stand on, enough to drop the second press.
+  expect((await $.tool.call({ tool: 'Bash', command: COMMENT })).deny).toMatch(/Card r1 is up/)
+  const ui = await $.ui.mount({ ...PANE, surface: 'vscode' })
+  await ui.press({ key: 'r1-send' })
+  expect(submitted[submitted.length - 1]).toBe('[HCP r1] Send it: make the held gh issue comment call again, unchanged.')
+  await ui.unmount()
+})
+
+test('Always here saves a Claude Code permission rule in the project and lets like calls through from then on', async ($, on) => {
+  const submitted = engine(on, KEYED)
+  const ran = tools(on)
+  jev(on, {})
+  const files = ledger(on)
+  await $.session.start({ cwd: '/work/hcp', surface: 'vscode', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: COMMENT })
+  const ui = await $.ui.mount({ ...PANE, surface: 'vscode' })
+  await ui.press({ key: 'r1-always' })
+  await ui.press({ key: 'r1-always' })
+  await settle()
+  expect(JSON.parse(files.get('/work/hcp/.claude/settings.local.json')!).permissions.allow).toEqual(['Bash(gh issue comment *)'])
+  expect(submitted[submitted.length - 1]).toContain('allowed calls like it in this project from now on (Bash(gh issue comment *)')
+  expect((await $.tool.call({ tool: 'Bash', command: COMMENT })).deny).toBe(undefined)
+  expect((await $.tool.call({ tool: 'Bash', command: "gh issue comment 40 -R dipseth/hcp --body 'shipped'" })).deny).toBe(undefined)
+  expect(ran.length).toBe(2)
+  await ui.unmount()
+})
+
+test('stopping a run keeps what was on screen and what the person said next; typing mid-run is kept too', async ($, on) => {
+  engine(on, KEYED)
+  tools(on)
+  turns(on)
+  jev(on, {})
+  const files = ledger(on)
+  await $.session.start({ cwd: '/work/hcp', surface: 'vscode', isInteractive: true })
+  await $.turn.start({ turnId: 't1' } as never)
+  await $.tool.call({ tool: 'Edit', file_path: '/work/hcp/hooks/reach.ts', old_string: 'a', new_string: 'b' } as never)
+  await $.turn.complete({ turnId: 't1', answer: 'Refactoring the reach gate', durationMs: 1, isAborted: true, reason: 'aborted' } as never)
+  await $.prompt.submit({ text: "don't refactor, just fix the regex. token ghp_abcdef123", origin: { kind: 'composer' } } as never)
+  await settle()
+  await $.turn.start({ turnId: 't2' } as never)
+  await $.prompt.submit({ text: 'also run the tests', origin: { kind: 'composer' } } as never)
+  await settle()
+  const rows = [...files.entries()]
+    .filter(([path]) => path.includes('/interrupts/'))
+    .flatMap(([, text]) => text.trim().split('\n'))
+    .map(line => JSON.parse(line) as Record<string, unknown>)
+  expect(rows.map(r => [r.kind, r.said, r.project])).toEqual([
+    ['aborted', "don't refactor, just fix the regex. token [redacted]", 'hcp'],
+    ['mid-turn', 'also run the tests', 'hcp'],
+  ])
+  expect(rows[0]!.doing).toBe('Refactoring the reach gate')
+  expect(rows[0]!.calls).toEqual([{ tool: 'Edit', channel: 'Edit', summary: '/work/hcp/hooks/reach.ts' }])
+})
+
+test('steers are drafted from redirects, ranked by code, topped up with the defaults, and the classifier sees interrupts as notes', () => {
+  const input = {
+    project: 'hcp',
+    redirects: [1, 2, 3, 4].map(n => ({ n, ago: '1h ago', doing: 'Edit', said: 'run the tests first' })),
+    presses: {},
+  }
+  const draft = JSON.stringify([
+    { label: '🧪 Tests first', text: 'Run claude plugin test before anything else.', covers: [1, 2, 3] },
+    { label: '🌀 One-off', text: 'x', covers: [4] },
+    { label: 'bad' },
+  ])
+  const { steers } = rankSteers(draft, input, { min_covers: 2, half_life: 10, press: 0.5 })
+  expect(steers.map(t => [t.label, t.source, t.covers])).toEqual([['🧪 Tests first', 'learned', 3]])
+  expect(withDefaults(steers).map(t => t.label)).toEqual(['🧪 Tests first', ...DEFAULT_STEERS.slice(0, 3).map(t => t.label)])
+  expect(rankSteers('not json', input, {}).steers).toEqual([])
+  expect(needsBuild(undefined, 2)).toBe(false)
+  expect(needsBuild(undefined, 3)).toBe(true)
+  expect(needsBuild({ project: 'hcp', steers: [], builtFrom: 3, builtAt: 0 }, 5)).toBe(false)
+  expect(saidOf('[HCP c1] Send')).toBe(undefined)
+  const rows = [
+    { at: 0, kind: 'aborted' as const, project: 'hcp', doing: 'pushing', calls: [{ tool: 'Bash', channel: 'git push', summary: '' }], said: 'not yet', source: 'live' as const },
+    { at: 50, kind: 'mid-turn' as const, project: 'hcp', doing: '', calls: [], said: 'newer', source: 'live' as const },
+    { at: 60, kind: 'mid-turn' as const, project: 'other', doing: '', calls: [], said: 'elsewhere', source: 'live' as const },
+  ]
+  expect(notesFor(rows, 'hcp', 3_600_000, 'git push').map(n => n.said)).toEqual(['not yet', 'newer'])
+})
+
+test('a pasted picture gets a Full size button that opens it in VS Code', async ($, on) => {
+  engine(on)
+  const ran = pictures(on)
+  await $.session.start({ cwd: '/', surface: 'vscode', isInteractive: true })
+  const ui = await $.ui.mount({ ...PANE, surface: 'vscode' })
+  await ui.input({ key: 'quick-0', text: "'/Users/me/shot one.png'" })
+  await settle()
+  await ui.press({ key: 'outbox-open-0' })
+  await settle()
+  expect(ran.some(argv => argv[0] === 'code' && argv[2] === '/Users/me/shot one.png')).toBe(true)
+  await ui.unmount()
 })

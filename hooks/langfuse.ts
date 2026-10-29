@@ -1,6 +1,6 @@
 // Langfuse as the decision pipeline's tracer and scores ports: every run is a
-// trace (one span per node), and every card answer is a score on the trace of
-// the run it judges. Best effort by contract: Langfuse being down never blocks
+// trace (one span per node) sent over OTLP/HTTP in Langfuse's v4 shape, and
+// every card answer is a score on the run's root observation. Best effort by contract: Langfuse being down never blocks
 // a call, a card or a run; the local ledger keeps everything regardless.
 
 import type { EngineInterface, PluginOptions } from 'claude-code'
@@ -81,13 +81,19 @@ export async function langfuseFrom($: Engine): Promise<LangfuseConfig | undefine
 }
 
 const newId = () => sha256Hex(`${Date.now()}:${Math.random()}:${Math.random()}`).slice(0, 32)
-const iso = (ms: number) => new Date(ms).toISOString()
+/** The root span's id, derived from the trace id, so a score written later can target the root observation. */
+export const rootSpanId = (traceId: string) => traceId.slice(0, 16)
+const nanos = (ms: number) => `${Math.round(ms)}000000`
 
-async function post($: Engine, cfg: LangfuseConfig, path: string, body: unknown) {
+/** The OTLP endpoint and the header that selects Langfuse's v4 (observations-first) ingestion. */
+export const OTEL_PATH = '/api/public/otel/v1/traces'
+const V4_HEADER = { 'x-langfuse-ingestion-version': '4' }
+
+async function post($: Engine, cfg: LangfuseConfig, path: string, body: unknown, headers: Record<string, string> = {}) {
   try {
     await $.http.fetch(`${cfg.baseUrl}${path}`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: cfg.auth },
+      headers: { 'content-type': 'application/json', authorization: cfg.auth, ...headers },
       body: JSON.stringify(body),
     })
   } catch {
@@ -95,52 +101,129 @@ async function post($: Engine, cfg: LangfuseConfig, path: string, body: unknown)
   }
 }
 
+type AttrValue = { stringValue: string } | { arrayValue: { values: { stringValue: string }[] } }
+type Attr = { key: string; value: AttrValue }
+
+const asString = (value: unknown) => (typeof value === 'string' ? value : JSON.stringify(value ?? null))
+const attr = (key: string, value: unknown): Attr =>
+  Array.isArray(value) && value.every(v => typeof v === 'string')
+    ? { key, value: { arrayValue: { values: (value as string[]).map(v => ({ stringValue: v })) } } }
+    : { key, value: { stringValue: asString(value) } }
+
+/** An observation as it is built in memory: exported once, complete, when the run ends. */
+type Built = {
+  spanId: string
+  parentSpanId?: string
+  name: string
+  type: string
+  startMs: number
+  endMs?: number
+  input?: unknown
+  output?: unknown
+  metadata: Record<string, unknown>
+  isError?: boolean
+}
+
+/** A node's observation type: model-backed nodes are generations (with their cost), the rest spans. */
+const typeOfNode = (metadata: Record<string, unknown>) => (metadata.kind === 'decide' || metadata.kind === 'generate' ? 'generation' : 'span')
+
+/** One complete OTLP/JSON span, with the trace-wide attributes copied onto it so every observation filters alike. */
+function otlpSpan(traceId: string, b: Built, shared: Attr[]) {
+  const attributes: Attr[] = [
+    ...shared,
+    attr('langfuse.observation.type', b.type),
+    ...(b.input !== undefined ? [attr('langfuse.observation.input', b.input)] : []),
+    ...(b.output !== undefined ? [attr('langfuse.observation.output', b.output)] : []),
+    ...Object.entries(b.metadata)
+      .filter(([, v]) => v !== undefined)
+      .map(([k, v]) => attr(`langfuse.observation.metadata.${k}`, v)),
+    ...(b.type === 'generation' && typeof b.metadata.cost_usd === 'number' ? [attr('langfuse.observation.cost_details', { total: b.metadata.cost_usd })] : []),
+  ]
+
+  return {
+    traceId,
+    spanId: b.spanId,
+    ...(b.parentSpanId ? { parentSpanId: b.parentSpanId } : {}),
+    name: b.name,
+    kind: 1,
+    startTimeUnixNano: nanos(b.startMs),
+    endTimeUnixNano: nanos(b.endMs ?? b.startMs),
+    attributes,
+    status: { code: b.isError ? 2 : 1 },
+  }
+}
+
 /**
- * A tracer for one run: the root opens a trace whose id is the run id, each
- * node a span under it. The whole trace goes in one batch when the run ends,
- * in the background, so a run never waits on Langfuse.
+ * A tracer for one run, in Langfuse's v4 shape: the run is one OTEL trace
+ * whose id is the run id, the root observation carries the run's input and
+ * output, and each node is a child span. Trace name, session, tags and user
+ * are copied onto every span. Nothing is sent until the run ends; then the
+ * whole trace goes in one OTLP/HTTP request in the background, so a run never
+ * waits on Langfuse and no span is ever exported twice.
  */
 export function langfuseTracer($: Engine, cfg: LangfuseConfig, extraTags: readonly string[] = []): TracePort {
-  const events: Record<string, unknown>[] = []
+  const children: Built[] = []
   let traceId: string | null = null
-  const handle = (target: Record<string, unknown>): SpanHandle => ({
+  let root: Built | undefined
+  const handle = (target: Built, tags?: string[]): SpanHandle => ({
     get traceId() {
       return traceId
     },
-    setMetadata: metadata => void (target.metadata = { ...(target.metadata as object), ...metadata }),
+    setMetadata: metadata => void (target.metadata = { ...target.metadata, ...metadata }),
     setOutput: output => void (target.output = output),
-    setTags: tags => void (target.tags = [...new Set([...((target.tags as string[]) ?? []), ...tags])]),
+    setTags: more => void (tags && tags.push(...more.filter(t => !tags.includes(t)))),
   })
 
   return {
     async root(opts, fn) {
       traceId = newId()
-      const started = Date.now()
-      const body: Record<string, unknown> = {
-        id: traceId,
-        name: opts.name,
-        input: opts.input,
-        sessionId: opts.group,
-        tags: [...opts.tags, ...extraTags],
-        metadata: opts.metadata,
-        ...(opts.userId ? { userId: opts.userId } : {}),
-        timestamp: iso(started),
-      }
+      const tags = [...new Set([...opts.tags, ...extraTags])]
+      root = { spanId: rootSpanId(traceId), name: opts.name, type: 'chain', startMs: Date.now(), input: opts.input, metadata: { ...opts.metadata } }
+      let failed = false
       try {
-        return await fn(handle(body))
+        return await fn(handle(root, tags))
+      } catch (error) {
+        failed = true
+        throw error
       } finally {
-        events.unshift({ id: newId(), type: 'trace-create', timestamp: iso(started), body })
-        void post($, cfg, '/api/public/ingestion', { batch: events })
+        root.endMs = Date.now()
+        root.isError = failed
+        const shared = [
+          attr('langfuse.trace.name', opts.name),
+          attr('langfuse.session.id', opts.group),
+          attr('langfuse.trace.tags', tags),
+          ...(opts.userId ? [attr('langfuse.user.id', opts.userId)] : []),
+        ]
+        const id = traceId
+        const spans = [root, ...children].map(b => otlpSpan(id, b, shared))
+        void post(
+          $,
+          cfg,
+          OTEL_PATH,
+          { resourceSpans: [{ resource: { attributes: [attr('service.name', 'hcp')] }, scopeSpans: [{ scope: { name: 'hcp' }, spans }] }] },
+          V4_HEADER,
+        )
       }
     },
     async span(opts, fn) {
-      const started = Date.now()
-      const body: Record<string, unknown> = { id: newId(), traceId, name: opts.name, input: opts.input, metadata: opts.metadata, startTime: iso(started) }
+      const built: Built = {
+        spanId: newId().slice(0, 16),
+        ...(root ? { parentSpanId: root.spanId } : {}),
+        name: opts.name,
+        type: 'span',
+        startMs: Date.now(),
+        input: opts.input,
+        metadata: { ...opts.metadata },
+      }
       try {
-        return await fn(handle(body))
+        return await fn(handle(built))
+      } catch (error) {
+        built.isError = true
+        throw error
       } finally {
-        body.endTime = iso(Date.now())
-        events.push({ id: newId(), type: 'span-create', timestamp: iso(started), body })
+        built.endMs = Date.now()
+        built.type = typeOfNode(built.metadata)
+        children.push(built)
       }
     },
   }
@@ -148,12 +231,15 @@ export function langfuseTracer($: Engine, cfg: LangfuseConfig, extraTags: readon
 
 /** A card's answer as a Langfuse score on the run's trace. */
 export function langfuseScore($: Engine, cfg: LangfuseConfig, score: ScoreRequest): Promise<void> {
+  // POST /scores stays the supported write path in v4. The root observation is the run's v4 target.
+  const comment = [score.label, score.comment].filter(Boolean).join(': ')
+
   return post($, cfg, '/api/public/scores', {
     traceId: score.runId,
+    ...(/^[0-9a-f]{32}$/.test(score.runId) ? { observationId: rootSpanId(score.runId) } : {}),
     name: score.name,
     value: score.value,
     dataType: score.dataType,
-    ...(score.comment ? { comment: score.comment } : {}),
-    ...(score.label ? { comment: [score.label, score.comment].filter(Boolean).join(': ') } : {}),
+    ...(comment ? { comment } : {}),
   })
 }

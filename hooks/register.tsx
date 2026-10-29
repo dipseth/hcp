@@ -7,7 +7,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderSurface } from 'claude-code'
 
 import type { HcpApproval, HcpCard, HcpDecision, HcpDelivery, HcpEvidence, HcpGrant, HcpLink, HcpMedia, HcpMode, HcpOutward, HcpScheduled } from '../types'
-import { bindSession, loadHistory, pipelineTool, resolved, shadow, shadowReport } from './decide'
+import { bindInterrupts, bindSession, loadHistory, pipelineTool, resolved, shadow, shadowReport } from './decide'
 import {
   EVIDENCE_TOOL,
   LINK_COMMANDS,
@@ -28,12 +28,15 @@ import { DEFAULT_LAYOUT, LAYOUT_TOOL, layoutDescription, layoutRequestText, pars
 import type { LayoutFile } from './layout'
 import { useOptions } from './langfuse'
 import { existing, expandAll, pastedImages, prepare, saveBytes, thumbnails } from './media'
-import { appendLedger, generatePort, initObservability, reachPorts, scoresPort } from './ports'
+import { allowInSettings, answerRows, interruptRows, loadMemory, pressesFor, readSteers, rememberAnswer, rememberInterrupt, rememberPress, ruleFor, saveSteers } from './memory'
+import { appendLedger, decidePort, generatePort, initObservability, reachPorts, ROUTES, scoresPort, tracerFor, within } from './ports'
 import { floorOf } from './surface'
 import type { Judged } from './ports'
-import { callKey, classifyCall, reachPipeline } from './reach'
+import { blankQuotes, callKey, classifyCall, reachPipeline, recordOf, scopeOf } from './reach'
+import { DEFAULT_STEERS, STEER_ROUTE, missedQuestions, needsBuild, notesFor, projectOf, saidOf, steerInput, steersPipeline } from './steers'
+import type { InterruptRow, SteerDef, TurnCall } from './steers'
 import { hashToUnit } from './vendor/dp.js'
-import type { CallFacts, ReachVerdict } from './reach'
+import type { CallFacts, ReachVerdict, SettingsVerdict } from './reach'
 import { runPipeline, submitFeedback } from './vendor/dp.js'
 import type { RunRecord } from './vendor/dp.js'
 import {
@@ -43,7 +46,6 @@ import {
   PIPELINE_TOOL,
   MAX_MEDIA,
   SHARE_TOOL,
-  STEERS,
   VIDEO_FILE,
   answerText,
   applyExtensions,
@@ -74,7 +76,7 @@ import {
   splitPaths,
   withTweak,
 } from './model'
-import type { Extension, ReachChoice, Steer, When } from './model'
+import type { Extension, ReachChoice, When } from './model'
 import { cardView, inbox, reachBadge } from './views'
 import type { Actions, Snapshot } from './views'
 
@@ -104,6 +106,7 @@ let linkSent = 0
 const layout = atom({ plugin: 'hcp', key: 'layout' } as const, { current: DEFAULT_LAYOUT } as LayoutFile)
 const isAddingLink = atom({ plugin: 'hcp', key: 'isAddingLink' } as const, false)
 const isAskingLayout = atom({ plugin: 'hcp', key: 'isAskingLayout' } as const, false)
+const steerSet = atom({ plugin: 'hcp', key: 'steers' } as const, DEFAULT_STEERS as SteerDef[])
 
 const LAYOUT_FILE = '.claude/hcp/layout.json'
 
@@ -276,6 +279,40 @@ const passes = new Map<string, string>()
 const busy = new Set<string>()
 // Whether a main-conversation turn is running: a prompt submitted now queues behind it.
 let isTurnRunning = false
+// The surface the pane last drew on: where a picture opens full size.
+let lastSurface: RenderSurface | undefined
+// The session's working directory and its project name, which records and steers are kept under.
+let cwd = ''
+let project = 'root'
+// The main loop's calls in the running turn: what the person saw when they stopped it.
+let turnCalls: TurnCall[] = []
+// A turn the person stopped, waiting for what they type next.
+let pendingStop: Omit<InterruptRow, 'said' | 'source' | 'project'> | undefined
+// Rules "Always" added this session: honoured at once, before the engine reloads its settings.
+const alwaysRules = new Set<string>()
+// The run that built this project's steers: presses and misses are its feedback.
+let steerRunId: string | undefined
+let isBuildingSteers = false
+const STOP_WINDOW_MS = 30 * 60_000
+
+/**
+ * Opens a file full size: in VS Code an image opens in the editor's own viewer
+ * (the `code` CLI, else the app by name), elsewhere the system's default app.
+ */
+async function openFile($: Engine, path: string, isImage: boolean, surface = lastSurface) {
+  const tries: string[][] =
+    isImage && surface === 'vscode'
+      ? [['code', '-r', path], ['open', '-a', 'Visual Studio Code', path], ['open', path]]
+      : [['open', path], ['xdg-open', path]]
+  for (const argv of tries) {
+    try {
+      if ((await $.process.run(argv, { timeoutMs: 10_000 })).exitCode === 0) return
+    } catch {
+      // Not on this machine: the next way.
+    }
+  }
+  $.ui.toast(`Open it yourself: ${path}`)
+}
 
 const QUEUED_TOAST = "Queued: Claude picks it up when its current turn ends. The card shows ⏳ until then."
 
@@ -670,6 +707,29 @@ async function grantFor($: Engine, facts: CallFacts): Promise<HcpGrant | undefin
     .sort((a, b) => b.createdAt - a.createdAt)[0]
 }
 
+/** Remembers a main-loop call of the running turn: what was on screen if the person stops it. */
+function noteTurnCall(tool: string, facts: CallFacts, input: Record<string, unknown>) {
+  const target = ['file_path', 'path', 'pattern', 'url', 'query'].map(k => input[k]).find(v => typeof v === 'string') as string | undefined
+  const summary = clip((tool === 'Bash' ? blankQuotes(facts.content) : target ?? facts.content).replace(/\s+/g, ' '), 160)
+  turnCalls = [...turnCalls, { tool, channel: facts.channel, summary }].slice(-6)
+}
+
+/**
+ * Claude Code's own verdict on the call, from the person's settings: only a
+ * rule counts (a mode or the auto classifier is not the person's word on this
+ * call). Bounded, and quiet on failure: hcp then decides as before.
+ */
+async function settingsVerdict($: Engine, tool: string, input: Record<string, unknown>): Promise<SettingsVerdict | undefined> {
+  const args = Object.fromEntries(Object.entries(input).filter(([k]) => k !== 'tool' && k !== 'tool_use_id' && k !== 'agentId'))
+  try {
+    const verdict = await within($, 3000, $.tool.check({ tool, input: args }))
+
+    return verdict.rule === undefined ? undefined : { decision: verdict.decision, rule: verdict.rule }
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * Before every tool call: the rules' view, then (for anything that may leave
  * the machine) the reach pipeline. A call that notifies people runs only when
@@ -678,6 +738,7 @@ async function grantFor($: Engine, facts: CallFacts): Promise<HcpGrant | undefin
 async function guard($: Engine, e: { tool: string; tool_use_id: string; agentId?: string }, run: () => Promise<unknown>) {
   const input = e as unknown as Record<string, unknown>
   const facts = classifyCall(e.tool, input, reachTags())
+  if (e.agentId === undefined) noteTurnCall(e.tool, facts, input)
   if (facts.level === 'local' || facts.level === 'own') return run()
   const at = await $.clock.now()
   const key = callKey(e.tool, input)
@@ -696,11 +757,16 @@ async function guard($: Engine, e: { tool: string; tool_use_id: string; agentId?
   }
 
   const grant = await grantFor($, facts)
+  const scope = scopeOf(facts, repo)
+  const rule = ruleFor(facts)
+  const settings = rule !== undefined && alwaysRules.has(rule) ? { decision: 'allow' as const, rule } : await settingsVerdict($, e.tool, input)
+  const reachRecord = recordOf(answerRows(), facts.channel, scope)
+  const context = { ...(settings ? { settings } : {}), record: reachRecord, interrupts: notesFor(interruptRows(), project, at, facts.channel) }
   const judged: Judged = { by: 'rules', problems: [] }
   let record: RunRecord | undefined
   const ran = await runPipeline(
     reachPipeline,
-    { facts, ...(grant ? { grant: { channel: grant.channel, audience: grant.audience, intent: grant.intent, example: grant.example } } : {}) },
+    { facts, context, ...(grant ? { grant: { channel: grant.channel, audience: grant.audience, intent: grant.intent, example: grant.example } } : {}) },
     reachPorts($, judge(), judged, r => void (record = r)),
   )
   const verdict = ran.output as ReachVerdict
@@ -712,6 +778,10 @@ async function guard($: Engine, e: { tool: string; tool_use_id: string; agentId?
     level: verdict.level,
     branch: verdict.branch,
     judgedBy: judged.by,
+    scope,
+    ...(settings ? { settings } : {}),
+    sentBefore: reachRecord.sent,
+    heldBefore: reachRecord.held,
     ...(judged.problems.length > 0 ? { problems: judged.problems } : {}),
     record,
   })
@@ -721,6 +791,11 @@ async function guard($: Engine, e: { tool: string; tool_use_id: string; agentId?
   if (verdict.branch === 'badge') {
     await noteOutward($, { ...noted, verdict: 'badge' })
 
+    return run()
+  }
+  if (verdict.branch === 'standing') {
+    await noteOutward($, { ...noted, verdict: 'standing', scope, runId: ran.runId ?? ran.runKey })
+    // The engine's own check still runs: a settings allow lets it through, anything else asks as it would.
     return run()
   }
   if (verdict.branch === 'grant' && grant) {
@@ -752,6 +827,9 @@ async function guard($: Engine, e: { tool: string; tool_use_id: string; agentId?
       // No tracer, no run id: the run key names the run for its feedback.
       runId: ran.runId ?? ran.runKey,
       ...(grant ? { nearGrant: grant.id } : {}),
+      scope,
+      isFamiliar: reachRecord.sent >= 2 && !reachRecord.lastHeld,
+      ...(rule ? { rule } : {}),
     },
   })
   heldCalls.add(e.tool_use_id)
@@ -780,7 +858,8 @@ async function answerReach($: Engine, id: string, pressed: ReachChoice, typed?: 
     const at = await $.clock.now()
     const hours = GRANT_HOURS[choice]
     // A call that notifies people can't be unsent: the first press shows who gets it, the second sends.
-    if ((choice === 'send' || choice === 'edit' || hours !== undefined) && r.level === 'notifies') {
+    // Not when the person has sent like calls here before and kept none back: that friction taught nothing.
+    if ((choice === 'send' || choice === 'edit' || choice === 'always' || hours !== undefined) && r.level === 'notifies' && !r.isFamiliar) {
       if (card.armedAt === undefined || at - card.armedAt > ARM_MS) {
         const who = r.audience.length > 0 ? clip(r.audience.join(', '), 80) : 'its audience'
         await patchCard($, id, c => ({ ...c, armedAt: at, progress: `This notifies ${who} and can't be unsent. Press again to send.` }))
@@ -789,7 +868,17 @@ async function answerReach($: Engine, id: string, pressed: ReachChoice, typed?: 
       }
     }
     if (choice === 'edit' && sameText(note, r.content)) choice = 'send'
-    if (choice === 'send' || hours !== undefined) {
+    if (choice === 'always') {
+      const wrote = r.rule ? await allowInSettings($, cwd, r.rule) : { problem: 'no rule for this call' }
+      if (wrote.problem !== undefined) {
+        $.ui.toast(`Couldn't save the rule: ${wrote.problem}. Sent once instead.`, { timeoutMs: 10_000 })
+        choice = 'send'
+      } else {
+        alwaysRules.add(r.rule!)
+        $.ui.toast(`Saved ${r.rule} to ${wrote.file}: Claude Code and hcp both let calls like it through.`, { timeoutMs: 10_000 })
+      }
+    }
+    if (choice === 'send' || choice === 'always' || hours !== undefined) {
       await update($, approvals, list => [...list.filter(a => a.expiresAt > at), { callKey: r.callKey, cardId: id, expiresAt: at + APPROVAL_MS }])
     }
     if (choice === 'edit') {
@@ -817,10 +906,11 @@ async function answerReach($: Engine, id: string, pressed: ReachChoice, typed?: 
       // The feedback edge on the gate: was holding this call worth a card?
       void submitFeedback(
         reachPipeline,
-        { runId: r.runId, edgeId: 'reach-card', value: choice === 'send' || hours !== undefined ? 0 : 1, label: choice, sourceId: 'person' },
-        { scores: scoresPort($, { cardId: id, channel: r.channel }) },
+        { runId: r.runId, edgeId: 'reach-card', value: choice === 'send' || choice === 'always' || hours !== undefined ? 0 : 1, label: choice, sourceId: 'person' },
+        { scores: scoresPort($, { cardId: id, channel: r.channel, ...(r.scope ? { scope: r.scope } : {}), content: clip(r.content, 400) }) },
       ).catch(() => undefined)
     }
+    rememberAnswer({ at, channel: r.channel, label: choice, ...(r.scope ? { scope: r.scope } : {}), content: clip(r.content, 400) })
     const text = reachAnswerText(card, choice, note)
     drafts.delete(id)
     drafts.delete(`${id}:edit`)
@@ -847,6 +937,105 @@ async function describeIntent($: Engine, grant: HcpGrant) {
     if (text) await update($, grants, list => list.map(g => (g.id === grant.id ? { ...g, intent: clip(text, 160) } : g)))
   } catch {
     // The clipped content stays the intent.
+  }
+}
+
+/** A steer press: the text goes to Claude as a no-reply note, and the press is the steer set's feedback. */
+async function pressSteer($: Engine, steer: SteerDef) {
+  await deliver($, `[HCP steer] ${steer.text}`, 'nntr')
+  $.ui.toast('Steer sent: Claude picks it up at its next step.')
+  rememberPress(project, steer.label)
+  void appendLedger($, { type: 'steer', project, id: steer.id, label: steer.label, source: steer.source })
+  if (steerRunId !== undefined && steer.source === 'learned') {
+    void submitFeedback(
+      steersPipeline,
+      { runId: steerRunId, edgeId: 'steer-press', value: 1, label: steer.label, sourceId: 'person' },
+      { scores: scoresPort($, { project, steer: steer.label }) },
+    ).catch(() => undefined)
+  }
+}
+
+/** "Card next time" on a call that went through on the person's record: it counts against the record, and like calls are held again. */
+async function holdAgain($: Engine, toolUseId: string) {
+  const row = (await read($, outward)).find(o => o.toolUseId === toolUseId)
+  if (row === undefined || row.verdict !== 'standing' || row.isUndone) return
+  const at = await $.clock.now()
+  rememberAnswer({ at, channel: row.channel, label: 'hold-again', ...(row.scope ? { scope: row.scope } : {}) })
+  await update($, outward, list => list.map(o => (o.toolUseId === toolUseId ? { ...o, isUndone: true } : o)))
+  const scores = scoresPort($, { channel: row.channel, ...(row.scope ? { scope: row.scope } : {}) })
+  if (row.runId !== undefined) {
+    void submitFeedback(reachPipeline, { runId: row.runId, edgeId: 'standing-undo', value: 1, label: 'hold-again', sourceId: 'person' }, { scores }).catch(() => undefined)
+  }
+  $.ui.toast(`${row.channel} calls get a card again here.`)
+}
+
+/**
+ * What the person typed: after they stopped a run, or while one was going,
+ * it is a redirect. Kept as an interrupt for the classifier's context and the
+ * steer set; never scored as Claude getting something wrong.
+ */
+async function noteRedirect($: Engine, text: string) {
+  const at = await $.clock.now()
+  const said = saidOf(text)
+  let row: InterruptRow | undefined
+  if (pendingStop !== undefined && at - pendingStop.at < STOP_WINDOW_MS) {
+    row = { ...pendingStop, project, source: 'live', ...(said ? { said } : {}) }
+  } else if (isTurnRunning && said !== undefined) {
+    row = { at, kind: 'mid-turn', session: sessionId, project, doing: '', calls: turnCalls, said, source: 'live' }
+  }
+  pendingStop = undefined
+  if (row === undefined) return
+  await rememberInterrupt($, row)
+  if (row.said !== undefined) {
+    await checkMissed($, row.said)
+    await maybeBuildSteers($)
+  }
+}
+
+/** Did the person just type what a steer button offered? The classifier says; a miss is the steer set's feedback. */
+async function checkMissed($: Engine, said: string) {
+  const steers = await read($, steerSet)
+  const judged: Judged = { by: 'rules', problems: [] }
+  const frame = () => ({ state: { said, steers: steers.map(t => ({ label: t.label, text: t.text })) }, questions: missedQuestions(steers) })
+  const result = await decidePort($, judge(), judged, frame)({ nodeId: 'missed', nodeVersion: '1', questions: 'steer-missed', input: null, from: {} })
+  const best = steers
+    .map((t, at) => ({ t, p: result.distributions[`steer_${at}`]?.[0] ?? 0 }))
+    .sort((a, b) => b.p - a.p)[0]
+  if (best === undefined || best.p < 0.7) return
+  void appendLedger($, { type: 'steer-missed', project, label: best.t.label, source: best.t.source, p: best.p })
+  if (steerRunId !== undefined && best.t.source === 'learned') {
+    void submitFeedback(
+      steersPipeline,
+      { runId: steerRunId, edgeId: 'steer-missed', value: 1, label: best.t.label, sourceId: 'person' },
+      { scores: scoresPort($, { project, steer: best.t.label }) },
+    ).catch(() => undefined)
+  }
+}
+
+/** Builds this project's steers from its redirects when there are enough new ones; detached, so a session never waits on it. */
+async function maybeBuildSteers($: Engine) {
+  if (isBuildingSteers) return
+  const file = await readSteers($, project)
+  const redirects = interruptRows().filter(r => r.project === project && r.said !== undefined).length
+  if (!needsBuild(file, redirects)) return
+  isBuildingSteers = true
+  try {
+    const at = await $.clock.now()
+    const ran = await runPipeline(steersPipeline, steerInput(interruptRows(), project, pressesFor(project), at), {
+      ...tracerFor($, ['steers']),
+      generate: generatePort($, { ...ROUTES, 'steer-draft': STEER_ROUTE }),
+      records: r => void appendLedger($, { type: 'steers-run', project, record: r }),
+      clock: () => Date.now(),
+    })
+    const steers = (ran.output as { steers?: SteerDef[] }).steers ?? DEFAULT_STEERS
+    steerRunId = ran.runId ?? ran.runKey
+    await saveSteers($, { project, steers, builtFrom: redirects, builtAt: at, runId: steerRunId })
+    await update($, steerSet, () => steers)
+    void appendLedger($, { type: 'steers', project, branch: ran.route, labels: steers.map(t => t.label), builtFrom: redirects })
+  } catch (error) {
+    void appendLedger($, { type: 'steers-failed', project, error: String((error as Error).message).slice(0, 200) })
+  } finally {
+    isBuildingSteers = false
   }
 }
 
@@ -972,10 +1161,8 @@ function actionsFor($: Engine): Actions {
         await update($, isConcise, value => (isOn = !value))
         await deliver($, `[HCP concise] ${isOn ? 'on' : 'off'}`, 'nntr')
       })(),
-    steer: (kind: Steer) =>
-      void deliver($, `[HCP steer] ${STEERS[kind]}`, 'nntr').then(() =>
-        $.ui.toast('Steer sent: Claude picks it up at its next step.'),
-      ),
+    steer: steer => void pressSteer($, steer),
+    holdAgain: toolUseId => void holdAgain($, toolUseId),
     quick: kind =>
       void (async () => {
         if (kind === 'yes' || kind === 'no') {
@@ -1044,13 +1231,8 @@ function actionsFor($: Engine): Actions {
       slideDrafts.set(`${id}:${at}`, text)
       if (isKept) void patchCard($, id, c => ({ ...c, slideNotes: { ...c.slideNotes, [String(at)]: text.trim() } }))
     },
-    openMedia: media => {
-      const target = media.video ?? media.path
-      void $.process.run(['open', target], { timeoutMs: 10_000 }).then(
-        ran => ran.exitCode === 0 || $.ui.toast(`Couldn't open ${target}`),
-        () => $.ui.toast(`Open it yourself: ${target}`),
-      )
-    },
+    openMedia: media => void openFile($, media.video ?? media.path, media.video === undefined),
+    openImage: path => void openFile($, path, true),
     unattach: at => void update($, outbox, list => list.filter((_, i) => i !== at)),
     clearAttachments: () => void update($, outbox, () => []),
     clearFromYou: () => void update($, fromYou, () => []),
@@ -1140,6 +1322,7 @@ async function thumbsFor($: Engine, surface: RenderSurface, media: readonly HcpM
 }
 
 async function snapshot($: Engine, surface: RenderSurface): Promise<Snapshot> {
+  lastSurface = surface
   const at = await $.clock.now()
   const all = await read($, cards)
   const open = all.filter(c => c.status === 'open')
@@ -1163,6 +1346,7 @@ async function snapshot($: Engine, surface: RenderSurface): Promise<Snapshot> {
     fromYou: pasted,
     surface,
     thumbs: await thumbsFor($, surface, shown),
+    openImage: path => void openFile($, path, true, surface),
     grants: live,
     outward: (await read($, outward)).filter(o => o.verdict !== 'pass').slice(-8).reverse(),
     now: at,
@@ -1181,6 +1365,8 @@ async function snapshot($: Engine, surface: RenderSurface): Promise<Snapshot> {
     })()),
     isAddingLink: await read($, isAddingLink),
     isAskingLayout: await read($, isAskingLayout),
+    steers: await read($, steerSet),
+    project,
   }
 }
 
@@ -1295,6 +1481,16 @@ export const register: Register = (on, options) => {
     await loadLayout($)
     sessionId = await $.session.id().catch(() => 'session')
     repo = e.cwd.replace(/\/+$/, '').split('/').pop() || undefined
+    cwd = e.cwd
+    project = projectOf(e.cwd)
+    await loadMemory($)
+    bindInterrupts(() => notesFor(interruptRows(), project, Date.now()))
+    const steerFile = await readSteers($, project)
+    if (steerFile !== undefined && steerFile.steers.length > 0) {
+      await update($, steerSet, () => steerFile.steers)
+      steerRunId = steerFile.runId
+    }
+    void maybeBuildSteers($)
     liveDecisions = await read($, decisions)
     bindSession(() => liveDecisions)
     await loadHistory($)
@@ -1338,13 +1534,20 @@ export const register: Register = (on, options) => {
 
   // Whether the main conversation is mid-turn decides what a press is told: sent, or queued.
   on('turn.start', async ($, e, next) => {
-    if (e.agentId === undefined) isTurnRunning = true
+    if (e.agentId === undefined) {
+      isTurnRunning = true
+      turnCalls = []
+    }
 
     return next(e)
   })
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined) {
       isTurnRunning = false
+      // The person stopped it: what was on screen is kept until they say why, in their next message.
+      if (e.isAborted) {
+        pendingStop = { at: await $.clock.now(), kind: 'aborted', session: sessionId, doing: clip(e.answer.replace(/\s+/g, ' '), 300), calls: turnCalls }
+      }
       // The links Claude wrote inline stay reachable in the reel once the reply scrolls away.
       void harvestInto($, e.answer, { source: 'harvest' })
     }
@@ -1393,7 +1596,7 @@ export const register: Register = (on, options) => {
   on('tool.describe', async ($, e, next) => {
     const described = await next(e)
     if (e.tool === 'Bash') {
-      return { ...described, description: `${described.description}\n\nhcp holds commands that notify people (gh issue/pr comments, mail, chat webhooks) until the person approves the exact content on a card.` }
+      return { ...described, description: `${described.description}\n\nhcp holds commands that notify people (gh issue/pr comments, mail, chat webhooks) until the person approves the exact content on a card, unless a permission rule in their Claude Code settings allows the command or their record on like calls here lets it through.` }
     }
     if (!e.tool.startsWith('mcp__') || e.tool.startsWith(TOOL_PREFIX)) return described
     const facts = classifyCall(e.tool, {}, reachTags())
@@ -1534,6 +1737,7 @@ export const register: Register = (on, options) => {
   // Pictures pasted into the prompt box also show in the pane. The prompt passes on unchanged
   // and unawaited work; the reads start first, since the engine answers them only in flight.
   on('prompt.submit', async ($, e, next) => {
+    if (e.origin.kind === 'composer' && !e.command) void noteRedirect($, e.text).catch(() => undefined)
     const images = (e.attachments ?? []).filter(a => a.type === 'image')
     if (images.length === 0 || e.origin.kind !== 'composer') return next(e)
     const reads = images.map(a =>
@@ -1651,6 +1855,7 @@ export const register: Register = (on, options) => {
     const card = (await read($, cards)).find(c => c.toolUseId === e.props.tool_use_id)
     if (!card) return next(e)
     return cardView($.ui.resolve(e), card, actionsFor($), {
+      openImage: path => void openFile($, path, true, e.surface),
       surface: e.surface,
       laterLabel: smartLater(await $.clock.now(), offset).label,
       thumbs: await thumbsFor($, e.surface, card.media ?? []),
@@ -1675,7 +1880,7 @@ export const register: Register = (on, options) => {
     return (
       <Box flexDirection="column">
         {await next(e)}
-        {cardView(els, card, actionsFor($), { surface: e.surface, laterLabel, thumbs: new Map() })}
+        {cardView(els, card, actionsFor($), { surface: e.surface, laterLabel, thumbs: new Map(), openImage: path => void openFile($, path, true, e.surface) })}
       </Box>
     )
   })

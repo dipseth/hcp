@@ -498,7 +498,7 @@ export function heldText(card: HcpCard, mode: HcpMode): string {
 }
 
 /** The person's choice on a reach card. */
-export type ReachChoice = 'send' | 'similar-1h' | 'similar-day' | 'change' | 'edit' | 'draft' | 'not-now'
+export type ReachChoice = 'send' | 'similar-1h' | 'similar-day' | 'always' | 'change' | 'edit' | 'draft' | 'not-now'
 
 export const GRANT_HOURS: Partial<Record<ReachChoice, number>> = { 'similar-1h': 1, 'similar-day': 10 }
 
@@ -514,6 +514,9 @@ export function reachAnswerText(card: HcpCard, choice: ReachChoice, note: string
         : ` Similar ${r.channel} calls to the same audience may go through for the next ${hours === 1 ? 'hour' : `${hours} hours`} without a card.`
 
     return `[HCP ${card.id}] Send it: make the held ${r.channel} call again, unchanged.${grant}${said}`
+  }
+  if (choice === 'always') {
+    return `[HCP ${card.id}] Send it: make the held ${r.channel} call again, unchanged. The person allowed calls like it in this project from now on (${r.rule} in .claude/settings.local.json), so they go through without a card.${said}`
   }
   if (choice === 'change') {
     return `[HCP ${card.id}] Don't send the ${r.channel} call as it is. Change it:${said || ' see the note.'} Then make the call again; hcp shows it to the person once more.`
@@ -533,14 +536,6 @@ export function reachAnswerText(card: HcpCard, choice: ReachChoice, note: string
 export const postedText = (card: HcpCard) =>
   `Posted as card ${card.id}. Don't restate it in prose. The answer arrives as "[HCP ${card.id}] …" or "[HCP ${card.id} · NNTR] …".`
 
-export const STEERS = {
-  'no-code': "Don't write or edit code yet: investigate and plan only.",
-  'check-first': 'Check with me before your next write or outward-facing action.',
-  narrow: 'Narrow the scope to the one thing I asked for; park the rest.',
-  'wrap-up': 'Finish the current step, then stop and summarize in a few lines.',
-} as const
-
-export type Steer = keyof typeof STEERS
 
 export function parseOptions(raw: unknown): HcpOption[] {
   if (!Array.isArray(raw)) return []

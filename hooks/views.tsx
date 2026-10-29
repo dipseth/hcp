@@ -9,8 +9,9 @@ import type { HcpCard, HcpDecision, HcpDelivery, HcpEvidence, HcpGrant, HcpLink,
 import { KIND_ICON } from './evidence'
 import { drawnSections } from './layout'
 import type { Layout, SectionId } from './layout'
-import { STEERS, clip, labels, services } from './model'
-import type { ReachChoice, Steer } from './model'
+import { clip, labels, services } from './model'
+import type { ReachChoice } from './model'
+import type { SteerDef } from './steers'
 
 export type Actions = {
   pick: (id: string, value: string) => void
@@ -26,7 +27,9 @@ export type Actions = {
   authorizeMcp: () => void
   setMode: (mode: HcpMode) => void
   toggleConcise: () => void
-  steer: (steer: Steer) => void
+  steer: (steer: SteerDef) => void
+  /** A standing call should have been held: like calls get a card again. */
+  holdAgain: (toolUseId: string) => void
   quick: (kind: 'yes' | 'no' | 'yes-nntr' | 'no-nntr' | 'ack') => void
   quickDraft: (text: string) => void
   quickSend: (delivery: HcpDelivery, text?: string) => void
@@ -37,6 +40,7 @@ export type Actions = {
   /** Keystrokes in a slide's note field; `isKept` on Enter, which shows it under the slide. */
   slideNote: (id: string, at: number, text: string, isKept?: boolean) => void
   openMedia: (media: HcpMedia) => void
+  openImage: (path: string) => void
   unattach: (at: number) => void
   clearAttachments: () => void
   clearFromYou: () => void
@@ -99,6 +103,9 @@ export type Snapshot = {
   /** Which tucked-away fields are open. */
   isAddingLink: boolean
   isAskingLayout: boolean
+  /** This project's steer buttons: learned from its redirects, or the defaults. */
+  steers: SteerDef[]
+  project: string
 } & Pictures
 
 /** How pictures draw: the terminal's Image reads files, other surfaces' Svg carries bytes. */
@@ -106,6 +113,8 @@ export type Pictures = {
   surface: RenderSurface
   /** Thumbnail base64 by thumbnail path, for the surfaces that draw an Svg. */
   thumbs: ReadonlyMap<string, string>
+  /** Opens the full-size picture: VS Code's image viewer in the editor, Preview elsewhere. */
+  openImage?: (path: string) => void
 }
 
 /** What a card draws with besides itself. */
@@ -337,6 +346,8 @@ const svgOf = (base64: string, width: number, height: number) =>
 /**
  * One picture as the surface can draw it: the terminal's Image reading the png
  * itself, an Svg carrying the jpeg elsewhere, or its caption where neither can.
+ * Pictures take no press (only a Button does, and it holds text): the
+ * "⤢ Full size" button beside each one opens it.
  */
 function picture(els: ElementTable, m: HcpMedia, on: Pictures, isSmall: boolean) {
   const { Text } = els
@@ -390,9 +401,8 @@ function mediaBlock(els: ElementTable, card: HcpCard, act: Actions, ctx: CardCon
               {m.caption && <Text dimColor>{clip(m.caption, isSmall ? 22 : 80)}</Text>}
               <Button
                 key={`${id}-open-${at}`}
-                label={m.video ? '▶ Play' : '⤢ Open'}
+                label={m.video ? '▶ Play' : '⤢ Full size'}
                 plain
-                dimColor
                 {...(media.length === 1 ? key('o') : {})}
                 onPress={() => act.openMedia(m)}
               />
@@ -444,6 +454,7 @@ function thumbRow(els: ElementTable, media: HcpMedia[], on: Pictures, prefix: st
           {picture(els, m, on, true)}
           <Box flexDirection="row" gap={1}>
             <Text dimColor>{clip(m.caption ?? baseName(m.path), 22)}</Text>
+            {on.openImage && <Button key={`${prefix}-open-${at}`} label="⤢ Full size" plain onPress={() => on.openImage!(m.path)} />}
             {remove && <Button key={`${prefix}-x-${at}`} label="×" plain dimColor onPress={() => remove(at)} />}
           </Box>
         </Box>
@@ -477,6 +488,9 @@ const minutesLeft = (until: number, now: number) => {
 }
 
 /** One line under a tool row, or in the pane's ledger: where the call went and on whose say-so. */
+/** A verdict's reason is the level's, then the gate's after " → ": the gate's is what decided. */
+const gateReason = (why: string) => why.split(' → ').pop() ?? why
+
 export function reachBadge(els: ElementTable, row: HcpOutward, now: number) {
   const { Text } = els
   const level = row.level ? LEVEL_LABEL[row.level] : 'reach unknown'
@@ -488,7 +502,11 @@ export function reachBadge(els: ElementTable, row: HcpOutward, now: number) {
         ? `sent from card ${row.cardId}`
         : row.verdict === 'grant'
           ? `allowed by grant ${row.grantId}`
-          : level
+          : row.verdict === 'standing'
+            ? row.isUndone
+              ? 'standing undone: cards again'
+              : `no card: ${clip(gateReason(row.why), 80)}`
+            : level
   const color = row.level === 'notifies' ? THEME.reach : undefined
   const ago = Math.round((now - row.at) / 60_000)
 
@@ -496,7 +514,7 @@ export function reachBadge(els: ElementTable, row: HcpOutward, now: number) {
     <Text dimColor={color === undefined}>
       <Text color={color}>{row.verdict === 'hold' ? '⏸' : '↗'}</Text> {row.channel}
       {to} · {how}
-      {row.verdict === 'hold' || row.verdict === 'badge' ? '' : ` · ${level}`}
+      {row.verdict === 'hold' || row.verdict === 'badge' || row.verdict === 'standing' ? '' : ` · ${level}`}
       {ago > 0 ? ` · ${ago}m ago` : ''}
     </Text>
   )
@@ -539,6 +557,7 @@ function reachCard(els: ElementTable, card: HcpCard, act: Actions, ctx: CardCont
           {big(els, '➤ Send · allow similar 1h')}
         </Button>
         <Button key={`${id}-similar-day`} label="… for today" onPress={() => act.reach(id, 'similar-day')} />
+        {r.rule && <Button key={`${id}-always`} label={`Always here · ${r.rule}`} onPress={() => act.reach(id, 'always')} />}
         <Button key={`${id}-draft`} label="Save as draft" onPress={() => act.reach(id, 'draft')} />
         <Button key={`${id}-not-now`} label="Not now" dimColor onPress={() => act.reach(id, 'not-now')} />
       </Box>
@@ -716,12 +735,6 @@ export function cardView(els: ElementTable, card: HcpCard, act: Actions, ctx: Ca
   )
 }
 
-const STEER_LABELS: Record<Steer, string> = {
-  'no-code': "✋ Don't code yet",
-  'check-first': '❓ Check with me first',
-  narrow: '🎯 Narrow scope',
-  'wrap-up': '🏁 Wrap up',
-}
 
 export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
   const { Box, Text, Button } = els
@@ -839,11 +852,11 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
         )}
       </Box>),
     'steer': (<Box flexDirection="column">
-        {section('Steer the current run')}
+        {section(s.steers.some(t => t.source === 'learned') ? `Steer the current run · learned from your redirects in ${s.project}` : 'Steer the current run')}
         <Box flexDirection="row" flexWrap="wrap" gap={1}>
-          {(Object.keys(STEERS) as Steer[]).map(k => (
-            <Button key={`steer-${k}`} label={STEER_LABELS[k]} onPress={() => act.steer(k)}>
-              {big(els, STEER_LABELS[k])}
+          {s.steers.map(t => (
+            <Button key={`steer-${t.id}`} label={t.label} onPress={() => act.steer(t)}>
+              {big(els, t.label)}
             </Button>
           ))}
         </Box>
@@ -938,7 +951,12 @@ export function inbox(els: ElementTable, s: Snapshot, act: Actions) {
         <Box flexDirection="column">
           {section('Outward this session')}
           {s.outward.map(o => (
-            <Box key={`outward-${o.toolUseId}`}>{reachBadge(els, o, s.now)}</Box>
+            <Box key={`outward-${o.toolUseId}`} flexDirection="row" gap={1}>
+              {reachBadge(els, o, s.now)}
+              {o.verdict === 'standing' && !o.isUndone && gateReason(o.why).startsWith('you sent') && (
+                <Button key={`outward-${o.toolUseId}-hold`} label="↺ card next time" plain dimColor onPress={() => act.holdAgain(o.toolUseId)} />
+              )}
+            </Box>
           ))}
         </Box>
       )),

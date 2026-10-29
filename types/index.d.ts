@@ -60,6 +60,9 @@ export type HcpDelivery = 'now' | 'nntr' | 'later'
 /** `local`: this machine. `own`: the person's accounts, nobody told. `shared`: others see it. `notifies`: a person gets a message. */
 export type ReachLevel = 'local' | 'own' | 'shared' | 'notifies'
 
+/** A steer button: its label, what it tells Claude, and whether it was learned from the person's redirects. */
+export type HcpSteer = { id: string; label: string; text: string; source: 'default' | 'learned'; covers?: number }
+
 /** A held call that reaches people, as its card shows it. */
 export type HcpReach = {
   tool: string
@@ -77,6 +80,12 @@ export type HcpReach = {
   runId?: string
   /** The grant it nearly fit, by id. */
   nearGrant?: string
+  /** The person has sent calls like it here before: one press sends, no second "are you sure". */
+  isFamiliar?: boolean
+  /** The Claude Code permission rule "Always" would add (`Bash(gh pr create *)`); no Always without one. */
+  rule?: string
+  /** The project or repo the person's record on this channel is kept under. */
+  scope?: string
 }
 
 export type HcpCard = {
@@ -163,8 +172,14 @@ export type HcpOutward = {
   audience: string[]
   /** Absent when nothing could tell. */
   level?: ReachLevel
-  verdict: 'pass' | 'badge' | 'grant' | 'hold' | 'approved'
+  /** `standing`: let through by the person's settings or record on like calls, with a way to undo that. */
+  verdict: 'pass' | 'badge' | 'standing' | 'grant' | 'hold' | 'approved'
   why: string
+  /** The reach run, for a standing call's "hold these again". */
+  runId?: string
+  scope?: string
+  /** The person said a standing call should have been held: like calls get a card again. */
+  isUndone?: boolean
   grantId?: string
   cardId?: string
   /** Which judge answered: `jev`, `haiku`, `rules`, `none`. */
@@ -286,6 +301,8 @@ declare module 'claude-code' {
       decisions: HcpDecision[]
       /** The Evidence reel: links the decisions rest on. */
       evidence: HcpEvidence[]
+      /** This project's steer buttons: learned from its redirects (hooks/steers.ts), else the defaults. */
+      steers: HcpSteer[]
       evidenceSeq: number
       /** Whether the reel shows every entry, stale ones included, or the top of the ranking. */
       showAllEvidence: boolean
